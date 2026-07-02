@@ -7,20 +7,19 @@
 
 ## Current project state
 
-Phase I (Data Collecting & Processing) — Issue 001 foundation laid down.
-No data has been acquired yet; no model has been trained. The shared
-project substrate (Colab environment, persistent Drive layout, dataset
-manifest schema + validator) is in place and verified by unit tests.
+Phase I (Data Collecting & Processing) — Issue 001 foundation laid down
+and reviewed. Rev 2 corrections are in: leakage enforcement is now
+complete (clip_id + source_path + subject_id), schema is at 1.1 with
+slice tags, dataset staging rules are documented, and the repo is
+initialised in git.
 
 Blockers for downstream issues:
-- Issue 002 (perception front-end / YOLO+ByteTrack) is unblocked now —
-  `issues/002-perception-frontend-yolo-bytetrack.md` lists 001 as its only
-  dependency.
+- Issue 002 (perception front-end / YOLO+ByteTrack) is unblocked.
 - All other issues (003-015) chain off 002 or later.
 
 ---
 
-## Completed work — Issue 001
+## Completed work — Issue 001 (rev 2)
 
 Stand up a reproducible Google Colab environment and a leakage-safe,
 role-locked dataset manifest.
@@ -30,13 +29,15 @@ role-locked dataset manifest.
 | Path | Purpose |
 |---|---|
 | `colab/setup.py` | Reusable Python module: Drive layout, approved pip stack, `pip freeze` capture, JSON run-log capture. Importable from notebook or script. |
-| `colab/001_setup.ipynb` | Colab notebook orchestrating mount → install → Drive layout → env lock → run log. Idempotent; safe to re-run on every fresh runtime. |
+| `colab/001_setup.ipynb` | Colab notebook orchestrating mount → install → Drive layout → env lock → run log. Idempotent. |
 | `requirements.txt` | Approved dependency stack. **Excludes `torch` and `torchvision` deliberately** — Colab ships a CUDA-matched build. |
-| `data/manifests/__init__.py` | Manifest schema (enums, `ClipRecord`, `Manifest`), YAML/JSON loader, and the validator split into named per-rule functions. |
-| `data/manifests/sample_manifest.yaml` | Placeholder manifest exercising every role and every vault rule. Validates cleanly. |
+| `data/manifests/__init__.py` | Schema (enums, `ClipRecord`, `Manifest`), YAML/JSON loader, validator split into named per-rule functions. **Schema version 1.1.** |
+| `data/manifests/sample_manifest.yaml` | 15 placeholder clips exercising every role, every vault rule, and every slice tag. |
+| `data/README.md` | Dataset staging rules: where datasets live, store-once rule, vault hard wall, manifest path conventions, licensing policy. |
 | `tests/__init__.py` | Makes `tests/` a package for `python -m unittest`. |
-| `tests/test_manifest_validator.py` | 13 unit tests covering every validator rule. All pass. |
+| `tests/test_manifest_validator.py` | **24** unit tests covering every validator rule. All pass. |
 | `context.txt` | This file. |
+| `.gitignore` | Excludes `__pycache__`, heavy Colab outputs, raw dataset material. |
 
 ### How to reproduce the Colab env
 
@@ -46,8 +47,8 @@ role-locked dataset manifest.
    - Install the approved dependency stack via `setup.install_approved_packages()`.
    - Verify Colab's torch is intact (CUDA available, cuDNN available).
    - Create `MyDrive/fall_detection/{datasets,artifacts,checkpoints,metrics,logs}`.
-   - Write a literal `pip freeze` snapshot to `artifacts/pip_freeze.txt`.
-   - Write a JSON run log (timestamp UTC, GPU, VRAM, CUDA, Python, Drive paths) to `logs/setup_run_log.json`.
+   - Write a literal `pip freeze` snapshot to `artifacts/pip_freeze.txt` on Drive.
+   - Write a JSON run log (timestamp UTC, GPU, VRAM, CUDA, Python, Drive paths) to `logs/setup_run_log.json` on Drive.
 
 ### How to run the manifest validator
 
@@ -57,96 +58,185 @@ python -m unittest tests.test_manifest_validator -v
 
 ---
 
-## Important decisions made in this step
+## Issue 001 review corrections (this revision)
 
-1. **Clip-level role locking.** Every clip carries exactly one role
-   (`debug`, `train`, `validate`, `frozen_unseen_test`). Datasets may
-   legitimately span multiple roles (Le2i and GMDCSA-24 are documented as
-   cross-listed), but each individual clip is unique and single-roled.
-   This is enforced by:
-   - the dataclass `role: ClipRole` field,
-   - the duplicate-`clip_id` check in the validator,
-   - the train-vs-validate disjointness check.
+The following corrections were folded in after the first pass. Each one
+addresses a specific acceptance-criterion gap called out in the review.
 
-2. **Colab-compatible dependency stack.** The approved stack is curated in
-   one place (`colab/setup.py:APPROVED_PIP_PACKAGES`) and mirrored in
-   `requirements.txt` as lower bounds. Any new dependency must be added
-   to both.
+### 1. Leakage enforcement is now complete
 
-3. **No reinstall of Colab torch / torchvision.** The setup explicitly
-   omits torch and torchvision from the pip install. Reinstalling them
-   from PyPI on Colab risks pulling a CPU-only wheel that breaks every
-   GPU model. Colab's pre-built versions are CUDA-matched to the runtime.
-   A sanity check (CUDA + cuDNN availability) runs in the notebook after
-   install so any silent breakage is caught immediately.
+The previous train/validate disjointness check only triggered on
+duplicate `clip_id`. Two additional checks now run:
 
-4. **Frozen unseen-test hard wall.** Datasets `omnifall`, `caucafall`,
-   `mcfd`, `fallvision` are enumerated in
-   `data/manifests/__init__.py:FROZEN_VAULT_DATASETS`. The validator
-   rejects:
-   - any clip from a vault dataset assigned a non-`frozen_unseen_test` role,
-   - any clip assigned `frozen_unseen_test` from a non-vault dataset
-     (the role is reserved for the vault).
-   This is the strongest leakage guarantee in the project; breaking it
-   invalidates every cross-dataset generalisation number we report.
+- **`_check_source_path_disjoint`** — train and validate must not share
+  the same `source_path`. Guards against the realistic failure mode where
+  two annotators assign different `clip_id`s to overlapping windows of
+  the same raw video.
+- **`_check_subject_id_disjoint`** — train and validate must not share
+  the same `subject_id` when one is set. Guards against subject-level
+  leakage where the model memorises person-specific cues instead of
+  learning the fall pattern.
 
-5. **Real `pip freeze` is the env lock.** `colab/setup.py:capture_pip_freeze`
-   writes a literal `pip freeze` to `artifacts/pip_freeze.txt`. This
-   captures any drift in Colab's base image into version control rather
-   than relying on a hand-maintained pin list. `requirements.txt` carries
-   lower bounds for human readability; `pip_freeze.txt` is authoritative.
+Three new test classes exercise both rules: `SourcePathDisjointTests`,
+`SubjectIdDisjointTests`, plus the original `DisjointTrainValidateTests`
+for the duplicate-clip_id case.
 
-6. **TrackEval is not in the default install.** It has no maintained pip
-   wheel. The install command (`pip install git+https://github.com/...`)
-   lives in `colab/setup.py:TRACKEVAL_INSTALL_NOTE` and must be run
-   manually when MOT metrics from TrackEval are needed.
+**Caveat (open issue).** Subject-level leakage enforcement depends on
+real `subject_id` population quality. When subject_id is `None` on both
+sides of a comparison, the rule has nothing to compare and silently
+passes. The check is correct, but it cannot save a manifest whose
+authors forgot to populate subject_id. We will tighten this if / when
+dataset authors are willing to commit subject IDs at scale. (See the
+*Open issues* section below.)
 
-7. **Validator rules are independently testable.** Each validation rule
-   lives in its own private function (`_check_*`). The test suite exercises
-   each one in isolation. Adding a new rule is one function + one test.
+### 2. Optional slice tags added
+
+Four nullable fields were added to `ClipRecord` for Issue 004's
+slice-based evaluation:
+
+- `lighting` — one of `daylight` / `dim` / `low_light` / `mixed` / `unknown`
+- `occlusion` — one of `none` / `partial` / `heavy` / `unknown`
+- `multi_person` — bool
+- `action_confuser` — one of `none` / `sitting` / `sleeping` / `resting`
+  / `exercising` / `crawling` (sourced from PRD user stories 18 / 29)
+
+Each value set is exposed as a frozen constant
+(`LIGHTING_VALUES`, `OCCLUSION_VALUES`, `ACTION_CONFUSER_VALUES`) so new
+buckets can be added in one line. Unknown values are **warnings**, not
+errors — researchers may legitimately need a new bucket, and adding one
+should not require a schema bump. Missing tags are not warned about:
+placeholder rows are legal until Issue 004 starts aggregating.
+
+The sample manifest demonstrates every tag on real rows so the schema
+is documented by example.
+
+### 3. Schema version bumped to 1.1
+
+The loader now checks `schema_version` against `SUPPORTED_SCHEMA_VERSIONS`
+and rejects unknown versions loudly. Bumping the manifest without
+updating the loader is now a hard error, not a silent fall-through.
+Both `1.0` and `1.1` are accepted so old manifests keep loading.
+
+### 4. Dataset staging documentation
+
+`data/README.md` covers the dataset-staging acceptance criterion in full:
+
+- Where each dataset lives on Drive (`datasets/<slug>/`).
+- **Store-once rule** — never re-download inside a Colab session.
+- **Frozen vault hard wall** — `omnifall`, `caucafall`, `mcfd`, `fallvision`
+  may only be staged under their own slugs and only referenced from
+  `frozen_unseen_test` manifest rows.
+- **Licensed / gated datasets** — manual staging only; no auto-fetch.
+- **Manifest paths must be Drive-relative**, not absolute.
+- **No raw material in git** — Drive is the data layer, git is the
+  source layer.
+
+### 5. Version control readiness
+
+The repo was already initialised as git (per the host environment) but
+had zero commits. The initial commit `75c73e8` lands everything in
+`.gitignore`'s allow-list:
+
+- `colab/`, `data/`, `tests/`, `requirements.txt`, `context.txt`,
+  `issues/` (PRD + per-issue specs as reference).
+- All 24 tests pass at commit time.
+
+The `.gitignore` now explicitly excludes Colab-only outputs
+(`artifacts/pip_freeze.txt`, `logs/setup_run_log.json`) and raw
+dataset material (`*.mp4`, `*.tar`, `datasets/`, `artifacts/crops/`,
+`metrics/`, etc.). Those files are produced by the setup notebook
+inside a real Colab session on Drive and are intentionally **not**
+fabricated in this repo — when they exist they live on Drive, not
+locally.
+
+---
+
+## Important decisions (carried forward from rev 1 + new in rev 2)
+
+1. **Clip-level role locking.** Every clip carries exactly one role.
+   Datasets may legitimately span multiple roles (Le2i and GMDCSA-24 are
+   documented as cross-listed), but each individual clip is unique and
+   single-roled.
+
+2. **Three-axis leakage enforcement.** Clip ID uniqueness + source_path
+   disjointness + subject_id disjointness across train and validate.
+   Plus the frozen-vault hard wall. These four rules together are the
+   only thing standing between honest cross-dataset numbers and a
+   misleading result.
+
+3. **Colab-compatible dependency stack.** Single source of truth at
+   `colab/setup.py:APPROVED_PIP_PACKAGES`, mirrored in `requirements.txt`.
+
+4. **No reinstall of Colab torch / torchvision.** Post-install sanity
+   check (CUDA + cuDNN availability) catches silent breakage.
+
+5. **Frozen unseen-test hard wall.** Vault datasets may ONLY appear in
+   `frozen_unseen_test`. The validator catches both directions.
+
+6. **Real `pip freeze` is the env lock.** Written by Colab to
+   `artifacts/pip_freeze.txt` on Drive.
+
+7. **TrackEval is not in the default install.** Documented in
+   `TRACKEVAL_INSTALL_NOTE`; manual install only.
+
+8. **Schema versioning is enforced, not assumed.** Unknown
+   `schema_version` is a hard error so the loader and manifest can't
+   silently drift.
+
+9. **Slice tags are advisory, not enforced.** Unknown values warn;
+   missing values don't warn. This keeps the validator permissive
+   during early data acquisition without letting typos hide.
+
+10. **Dataset staging lives on Drive, source lives in git.** Hard
+    rule documented in `data/README.md` and enforced by `.gitignore`.
 
 ---
 
 ## Open issues / not yet addressed
 
+- **Subject-level disjointness depends on real subject_id population quality.**
+  The check fires whenever two clips in different splits share a
+  `subject_id`. But if the manifest author leaves `subject_id=None` for
+  most clips, the check has nothing to compare and silently passes. We
+  will monitor the real population rate and either: (a) emit a warning
+  when a manifest has zero subject_ids on either side of a comparison,
+  or (b) require subject_id to be populated for vault-adjacent rows
+  before unlocking Issue 004's full evaluation. Decision deferred until
+  first real dataset acquisition.
 - **Real datasets are not yet acquired.** The `sample_manifest.yaml` is
   placeholder. Real clip IDs, `source_path`s, and provenance will land
   when issue 002/003 begin pulling data.
 - **Drive layout has no contents yet.** `MyDrive/fall_detection/` will be
   empty until the notebook is first run in a real Colab session.
-- **GPU class is not pinned.** The setup captures whatever GPU Colab
-  hands the session. The `~16 GB T4` baseline in the PRD is a target, not
-  a guarantee — if Colab assigns a smaller GPU (or no GPU at all), the
+- **GPU class is not pinned.** Setup captures whatever GPU Colab hands
+  the session. If Colab assigns a smaller GPU (or no GPU at all), the
   downstream pipelines must degrade gracefully.
-- **No subject-level leakage check yet.** `subject_id` is captured per
-  clip (so the same person in train + validate can be detected later) but
-  the validator does not enforce subject disjointness across train /
-  validate. Add this once real data is loaded and subject IDs are
-  populated.
 - **TrackEval install is manual.** No automation; documented in
   `TRACKEVAL_INSTALL_NOTE`.
-- **WebDataset shard format not yet chosen.** Issue 003 (clip generator)
-  will pick the actual shard naming / tar format. Setup just keeps the
-  dependency available.
+- **WebDataset shard format not yet chosen.** Issue 003 will pick the
+  shard naming / tar format. Setup just keeps the dependency available.
+- **No remote git host configured.** Initial commit is local only;
+  pushing to GitHub / GitLab is a separate step the project owner can
+  take when ready.
 
 ---
 
 ## Assumptions
 
 - **Python 3.10+ on Colab.** Colab's current image ships 3.10 / 3.11.
-  All approved dependencies are compatible.
-- **PyYAML is available.** It is in the approved stack and required by the
-  manifest loader. The loader surfaces a clear ImportError if missing.
-- **Drive mount succeeds.** If running outside Colab, the `DriveLayout`
+- **PyYAML is available.** It is in the approved stack and required by
+  the manifest loader. The loader surfaces a clear ImportError if missing.
+- **Drive mount succeeds.** If running outside Colab, `DriveLayout`
   falls back to a local path via `FALL_DETECTION_DRIVE_ROOT`.
-- **`nvidia-smi` is on PATH inside the Colab runtime.** If not (e.g. CPU
-  runtime), the run log records `gpu_name=null` rather than crashing.
+- **`nvidia-smi` is on PATH inside the Colab runtime.** If not, the
+  run log records `gpu_name=null` rather than crashing.
 - **The dataset slugs in `IN_SCOPE_DATASETS` / `FROZEN_VAULT_DATASETS`
   match the PRD.** Confirmed against `issues/prd.md` Phase I decisions.
 - **The `_DASH` convention for dataset slugs is stable.** Source files
-  in `data/manifests/sample_manifest.yaml` use lowercase + underscores
-  (`up_fall`, `caucafall`) for readability; the loader normalises to
-  lowercase so `URFD`, `urfd`, `UrFd` all parse identically.
+  use lowercase + underscores (`up_fall`, `caucafall`); the loader
+  normalises to lowercase so `URFD`, `urfd`, `UrFd` all parse identically.
+- **Local git commits only.** No remote is configured; `git push` will
+  fail until the owner wires one up. This is intentional and not a bug.
 
 ---
 
@@ -154,18 +244,20 @@ python -m unittest tests.test_manifest_validator -v
 
 ```
 fall_detection/
+├── .gitignore                 # Excludes pycache, Colab outputs, raw data
 ├── colab/
-│   ├── 001_setup.ipynb            # Colab setup notebook (run this first)
-│   └── setup.py                   # Reusable helpers imported by the notebook
+│   ├── 001_setup.ipynb        # Colab setup notebook (run this first in Colab)
+│   └── setup.py               # Reusable helpers imported by the notebook
 ├── data/
+│   ├── README.md              # Dataset staging rules
 │   └── manifests/
-│       ├── __init__.py            # Schema, loader, validator
-│       └── sample_manifest.yaml   # Placeholder manifest, validates cleanly
+│       ├── __init__.py        # Schema (v1.1), loader, validator
+│       └── sample_manifest.yaml # Placeholder manifest, validates cleanly
 ├── tests/
 │   ├── __init__.py
-│   └── test_manifest_validator.py # 13 unit tests, all pass
-├── issues/                        # PRD + per-issue specs (read-only reference)
-├── requirements.txt               # Approved dependency stack (no torch/torchvision)
-├── context.txt                    # This file
-└── (log/checkpoint dirs created on Drive at runtime)
+│   └── test_manifest_validator.py # 24 unit tests, all pass
+├── issues/                    # PRD + per-issue specs (reference)
+├── requirements.txt           # Approved dependency stack (no torch/torchvision)
+├── context.txt                # This file
+└── (log/checkpoint dirs created on Drive at runtime, never in git)
 ```
