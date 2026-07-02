@@ -1,0 +1,191 @@
+# Sample dataset manifest for the fall-detection project.
+#
+# This is a PLACEHOLDER manifest — the rows below do not point at real videos.
+# They exist to:
+#   1. document the schema by example,
+#   2. give the validator something concrete to chew on,
+#   3. give later issues (002, 003, 004, ...) a known-good starting shape.
+#
+# The real manifest will be populated as datasets are acquired per the
+# data-acquisition user stories (PRD #1, #2, #3). Issue 001 only stands up
+# the schema and the validation rules.
+#
+# Schema version: 1.1 — adds optional slice tags (lighting, occlusion,
+# multi_person, action_confuser) for Issue 004 slice-based evaluation.
+#
+# Required fields for every clip: clip_id, dataset, role, label, source_path.
+# Optional fields: subject_id, duration_sec, frame_count, notes, lighting,
+#                  occlusion, multi_person, action_confuser.
+#
+# Roles:
+#   debug               — fast smoke-test clips; may cross-list with train/validate
+#                         for le2i and gmdcsa24.
+#   train               — model training only.
+#   validate            — hyperparameter tuning / model selection.
+#   frozen_unseen_test  — HARD VAULT. Datasets omnifall / caucafall / mcfd /
+#                         fallvision may only appear here. Used only for the
+#                         final cross-dataset generalisation numbers.
+
+schema_version: "1.1"
+
+clips:
+
+  # ---------- DEBUG tier (small, fast smoke tests) ----------
+  - clip_id: urfd-debug-01
+    dataset: urfd
+    role: debug
+    label: fall
+    source_path: datasets/urfd/clips/fall-01.mp4
+    duration_sec: 6.0
+    frame_count: 180
+    lighting: daylight
+    occlusion: none
+    multi_person: false
+    action_confuser: none
+
+  - clip_id: urfd-debug-02
+    dataset: urfd
+    role: debug
+    label: no_fall
+    source_path: datasets/urfd/clips/no-fall-01.mp4
+    duration_sec: 5.5
+    frame_count: 165
+    lighting: dim
+    occlusion: partial
+    multi_person: false
+    action_confuser: sitting
+
+  - clip_id: gmdcsa24-debug-01
+    dataset: gmdcsa24
+    role: debug
+    label: fall
+    source_path: datasets/gmdcsa24/clips/fall-debug-01.mp4
+    lighting: mixed
+    occlusion: heavy
+    multi_person: true
+    action_confuser: none
+
+  - clip_id: le2i-debug-01
+    dataset: le2i
+    role: debug
+    label: fall
+    source_path: datasets/le2i/clips/coffee-room-01-fall.mp4
+    lighting: daylight
+    occlusion: none
+    multi_person: false
+    action_confuser: none
+
+  # ---------- TRAIN tier ----------
+  - clip_id: up_fall-train-01
+    dataset: up_fall
+    role: train
+    label: fall
+    source_path: datasets/up_fall/clips/train-fall-01.mp4
+    subject_id: subject-01
+    lighting: daylight
+    occlusion: none
+    multi_person: false
+    action_confuser: none
+
+  - clip_id: up_fall-train-02
+    dataset: up_fall
+    role: train
+    label: no_fall
+    source_path: datasets/up_fall/clips/train-no-fall-01.mp4
+    subject_id: subject-01
+    lighting: daylight
+    occlusion: none
+    multi_person: false
+    action_confuser: sitting
+
+  - clip_id: up_fall-train-03
+    dataset: up_fall
+    role: train
+    label: fall
+    source_path: datasets/up_fall/clips/train-fall-02.mp4
+    subject_id: subject-02
+    lighting: low_light
+    occlusion: partial
+    multi_person: false
+    action_confuser: none
+
+  - clip_id: gmdcsa24-train-01
+    dataset: gmdcsa24
+    role: train
+    label: fall
+    source_path: datasets/gmdcsa24/clips/train-fall-02.mp4
+    notes: "Cross-listed: gmdcsa24 also has debug clips above."
+
+  - clip_id: le2i-train-01
+    dataset: le2i
+    role: train
+    label: fall
+    source_path: datasets/le2i/clips/train-fall-01.mp4
+    notes: "Cross-listed: le2i also has debug clips above."
+
+  # ---------- VALIDATE tier (must be disjoint from train) ----------
+  - clip_id: up_fall-validate-01
+    dataset: up_fall
+    role: validate
+    label: fall
+    source_path: datasets/up_fall/clips/validate-fall-01.mp4
+    subject_id: subject-03   # different subject from train — proves disjointness
+    lighting: daylight
+    occlusion: partial
+    multi_person: true
+    action_confuser: none
+
+  - clip_id: le2i-validate-01
+    dataset: le2i
+    role: validate
+    label: no_fall
+    source_path: datasets/le2i/clips/validate-no-fall-01.mp4
+    lighting: dim
+    occlusion: none
+    multi_person: false
+    action_confuser: sleeping
+
+  # ---------- FROZEN UNSEEN TEST (hard vault — disjoint from everything else) ----------
+  - clip_id: omnifall-vault-01
+    dataset: omnifall
+    role: frozen_unseen_test
+    label: fall
+    source_path: datasets/omnifall/clips/vault-fall-01.mp4
+    lighting: low_light
+    occlusion: heavy
+    multi_person: true
+    action_confuser: none
+    notes: "VAULT: must never enter training or validation."
+
+  - clip_id: caucafall-vault-01
+    dataset: caucafall
+    role: frozen_unseen_test
+    label: no_fall
+    source_path: datasets/caucafall/clips/vault-no-fall-01.mp4
+    lighting: mixed
+    occlusion: none
+    multi_person: false
+    action_confuser: exercising
+    notes: "VAULT: must never enter training or validation."
+
+  - clip_id: mcfd-vault-01
+    dataset: mcfd
+    role: frozen_unseen_test
+    label: fall
+    source_path: datasets/mcfd/clips/vault-fall-01.mp4
+    lighting: daylight
+    occlusion: partial
+    multi_person: false
+    action_confuser: none
+    notes: "VAULT: must never enter training or validation."
+
+  - clip_id: fallvision-vault-01
+    dataset: fallvision
+    role: frozen_unseen_test
+    label: fall
+    source_path: datasets/fallvision/clips/vault-fall-01.mp4
+    lighting: dim
+    occlusion: heavy
+    multi_person: true
+    action_confuser: crawling
+    notes: "VAULT: must never enter training or validation."

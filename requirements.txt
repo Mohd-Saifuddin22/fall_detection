@@ -1,0 +1,29 @@
+# Approved dependency stack for the fall-detection project.
+#
+# IMPORTANT:
+#   - torch and torchvision are INTENTIONALLY ABSENT.
+#     Colab ships a CUDA-matched build that matches the runtime's GPU
+#     driver; reinstalling it from PyPI risks pulling a CPU-only wheel and
+#     breaking every model. We use whatever Colab provides and capture the
+#     exact versions in `artifacts/pip_freeze.txt` (see colab/setup.py).
+#   - The versions below are LOWER BOUNDS, not pins. The authoritative lock
+#     is the literal `pip freeze` snapshot written by colab/setup.py after
+#     every successful install. Anything you add here MUST also be added to
+#     APPROVED_PIP_PACKAGES in colab/setup.py.
+#   - TrackEval is intentionally excluded — it has no clean pip wheel. See
+#     colab/setup.py:TRACKEVAL_INSTALL_NOTE for the manual install command.
+#   - pyyaml is required by the dataset manifest loader (data/manifests/__init__.py).
+
+ultralytics>=8.3.0          # YOLO family (front-end detection)
+transformers>=4.45.0        # HuggingFace — VideoMAE, ViTPose backbones
+accelerate>=1.0.0           # HF launcher; required by transformers training
+webdataset>=0.2.103         # Sharded dataset reader (Drive-cached crop clips)
+opencv-python>=4.10.0       # Video decode / draw utilities
+decord>=0.6.0               # Fast video decode for clip pipelines
+Pillow>=10.4.0              # Image I/O
+scikit-learn>=1.5.0         # Metrics + simple baselines
+torchmetrics>=1.4.0         # PyTorch-native metrics (F1, AUPRC, etc.)
+motmetrics>=1.4.0           # MOT metrics (ID switches, IDF1, MOTA, HOTA)
+omegaconf>=2.3.0            # Hydra-style configs
+pyyaml>=6.0.1               # Manifest loader
+tqdm>=4.66.0                # Progress bars

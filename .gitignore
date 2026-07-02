@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ----------------------------------------------------------------------
+# Heavyweight Colab outputs — DO NOT commit.
+# ----------------------------------------------------------------------
+# These files are produced by `colab/setup.py:run_setup()` inside a real
+# Colab session, on Google Drive under MyDrive/fall_detection/. They do
+# NOT exist in this repo by default — when they do exist they live on
+# Drive, not locally. If you see them locally it means a developer ran
+# the setup outside Colab for smoke-testing; do not commit.
+artifacts/pip_freeze.txt
+logs/setup_run_log.json
+artifacts/crops/
+artifacts/skeletons/
+artifacts/checkpoints/
+metrics/
+
+# Raw and intermediate dataset material — lives on Drive only.
+# The manifest references these by path; they are never in git.
+datasets/
+*.tar
+*.tar.gz
+*.mp4
+*.avi
+*.mov
+*.npy
+*.npz
+
+# Local secrets (defensive — none expected)
+.env
+*.local
