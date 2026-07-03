@@ -325,20 +325,39 @@ The notebook records `GPU_NAME`, `RUNTIME_TYPE` (T4 / A100 / L4 /
 unknown), `torch.version.cuda`, and the local-staging root in the
 perception run summary JSON.
 
+### Extension to Issue 003 cropping
+
+The Issue 003 cropping runner reads source PNG frames to build crop
+tensors — same Drive FUSE small-file I/O bottleneck. The runner
+now accepts an optional `local_root` parameter (default `None` for
+backward compatibility; the 000 full-pipeline notebook passes
+`COLAB_LOCAL_ROOT_DEFAULT`). When set, each clip's source frames
+are copied to `<local_root>/crops_<clip_id>/` before any frame reads;
+the local copy is removed via `try / finally` on clip exit so a
+tracker exception can't leave stale frames behind.
+
+The `RunSummary` payload now records `local_staging_root` so a
+human reviewer can confirm the run used local staging. Set
+`FALL_DETECTION_SKIP_LOCAL_STAGING=1` to opt out.
+
 ### Files changed
 
 | Path | Change |
 |---|---|
 | `perception/local_staging.py` | New module: `LocalFrameStager`, `StagedClipContext`, `stage_clip_frames`. Per-clip copy with safe cleanup; numeric order preserved; source-Drive-unmodified guarantee. |
 | `tests/test_local_staging.py` | 11 new unit tests: numeric order preserved, stale frames removed between clips, source unmodified, skip-env-var path, empty clip, missing source frame, default root path, cleanup idempotence. |
+| `cropping/runner.py` | New optional `local_root` param. New `_load_frames_from_local` + `stage_clip_frames_for_cropping` helpers. `_process_clip` stages each clip locally with `try / finally` cleanup. `RunSummary` now carries `local_staging_root`. |
+| `tests/test_cropping_local_staging.py` | 6 new unit tests for the cropping-side staging (numerically named frames, source unchanged, safe sub-folder naming, repeated-call replace, skip env var, discovery round-trip). |
 | `colab/002_perception_urfd.ipynb` | Run cell now stages each clip locally before tracking. Logs drive→local copy time + throughput, tracking runtime, total runtime, post-staging FPS. Records GPU / runtime type / CUDA version. Documents T4-for-perception policy. |
+| `colab/000_full_pipeline.ipynb` | Both perception cells (13/14/16) AND cropping cells (19/20) updated for local staging + timing logs + compute policy. |
 | `context.txt` | This section. |
 
 ### Verification results
 
 ```
 $ python -m unittest discover tests
-Ran 180 tests in 3.521s — OK          # 169 prior + 11 new for local staging
+Ran 186 tests in 3.788s — OK          # 169 prior + 17 new
+                                       # (11 perception-side + 6 cropping-side)
 
 $ smoke test
 - numeric order preserved             : OK
@@ -346,7 +365,108 @@ $ smoke test
 - source Drive folder unmodified      : OK
 - skip-env-var path                   : OK
 - default local root                  : /content/fall_detection_local
+- cropping-side staging              : OK (numerical naming, replace on re-run)
 ```
+
+---
+
+## Notebook audit + import fixes (000_full_pipeline.ipynb)
+
+### Two import bugs found and fixed
+
+The 000_full_pipeline.ipynb had two wiring bugs that would have failed
+silently on a real Colab run:
+
+1. **Cell 14 (perception):** used `Path(p)` without importing `Path`.
+   Fixed by adding `from pathlib import Path` to the import block.
+2. **Cell 20 (crops):** imported `COLAB_LOCAL_ROOT_DEFAULT` from
+   `cropping.local_staging`, but the symbol actually lives in
+   `perception.local_staging`. Fixed by rewriting the import path.
+
+Plus two minor cleanup items pyflakes flagged as real warnings
+(filtered from the cross-cell "undefined name" warnings pyflakes emits
+on any multi-cell notebook):
+- dropped a redundant `f` prefix on a no-placeholder f-string,
+- removed an unused `from pathlib import Path` import in cell 16.
+
+### Process decision: notebooks must pass local static / import verification
+
+Before any notebook is shipped for a real Colab run, it must pass:
+
+    python scripts/verify_notebook.py <path>.ipynb
+
+The verifier checks:
+- Every `from <local_module> import <symbol>` is resolved against the
+  on-disk package layout; missing files or missing symbols are errors.
+- pyflakes runs on each cell (when available). Cross-cell "undefined
+  name" warnings are expected and reported as warnings, not errors;
+  other pyflakes issues (unused imports, missing f-string placeholders,
+  syntax errors) are reported as warnings that the human reviewer can
+  judge.
+
+The verifier is wired into the test suite:
+`tests/test_verify_notebook.py` proves it catches the same kind of
+bugs that landed in 000_full_pipeline.ipynb (wrong-package import,
+missing local module, missing symbol). It also runs the verifier as
+a CLI subprocess against a clean notebook, a buggy notebook, and a
+missing file path, asserting exit codes.
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `colab/000_full_pipeline.ipynb` | Cell 14: added `from pathlib import Path`. Cell 20: rewrote import path to `perception.local_staging`. Minor pyflakes-style cleanup. |
+| `scripts/fix_000_imports.py` | One-shot patcher that applies the two import fixes. Idempotent. |
+| `scripts/cleanup_000.py` | One-shot patcher that removes the harmless pyflakes warnings. |
+| `scripts/verify_notebook.py` | New verifier: AST-based local-import audit + pyflakes + CLI. Exits non-zero on real wiring bugs. Cross-cell "undefined name" warnings are surfaced but do NOT fail the build. |
+| `tests/test_verify_notebook.py` | 18 new unit tests covering the audit, CLI exit codes, the real 000 notebook, and the failure modes the audit must catch. |
+| `context.txt` | This section. |
+
+### Pre-Colab checklist (must pass before opening in Colab)
+
+```bash
+# 1. Unit tests
+python -m unittest discover tests
+
+# 2. Notebook verification
+python scripts/verify_notebook.py colab/000_full_pipeline.ipynb
+
+# 3. (When ready) Open colab/000_full_pipeline.ipynb in Colab with:
+#      - GPU runtime = T4 (NOT A100 — compute policy)
+#      - KAGGLE_USERNAME and KAGGLE_KEY in Colab Secrets
+#      - FALL_DETECTION_SKIP_LOCAL_STAGING unset
+```
+
+Both `python -m unittest discover tests` and
+`python scripts/verify_notebook.py colab/000_full_pipeline.ipynb` must
+exit 0 before opening the notebook.
+
+### Verification results
+
+```
+$ python -m unittest discover tests
+Ran 204 tests in 4.026s — OK          # 186 prior + 18 new for verify_notebook
+
+$ python scripts/verify_notebook.py colab/000_full_pipeline.ipynb
+Notebook        : colab\000_full_pipeline.ipynb
+Local imports   : OK (0 error(s))
+Pyflakes        : passed (all clean)
+Status          : OK — notebook is ready for Colab
+```
+
+### Next real validation
+
+The next real validation is running `000_full_pipeline.ipynb` on a T4
+GPU runtime with Kaggle credentials configured. Expected outcomes:
+
+- Local staging removes the Drive FUSE I/O bottleneck — FPS should
+  be substantially higher than the ~1.8 fps observed on L4/A100 before
+  the fix.
+- Per-clip tracking artefacts land at
+  `MyDrive/fall_detection/artifacts/perception/<clip_id>/` on Drive.
+- Crop shards land at `MyDrive/fall_detection/artifacts/crops/`.
+- The closure conditions for Issue 002 (track-through-fall visual
+  review) and Issue 003 (crop visual sanity check) can be assessed.
 
 ---
 

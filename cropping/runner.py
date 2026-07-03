@@ -12,19 +12,26 @@ on Drive".
 Pipeline (per clip):
 
     1. Load the Issue 002 detection JSON + clip record (from manifest).
-    2. Filter to ``camera == "cam0"`` (Issue 002 close-out decision).
-    3. Group detections by track_id into :class:`TrackedBox` rows.
-    4. Call :func:`build_windows_for_track` for each track.
-    5. For each emitted :class:`TrackWindow`, apply
-       :func:`compute_crop_geometry` per frame, then
-       :func:`apply_crop_to_frame`, write each frame + metadata into
-       a shard via :class:`ShardWriter`.
-    6. Record every skip reason in the run-level summary.
+    2. Stage the source frames from Drive to a local-disk sub-folder
+       (same I/O reasoning as the Issue 002 perception fix — small-
+       file reads from Drive FUSE were the bottleneck).
+    3. Filter to ``camera == "cam0"`` (Issue 002 close-out decision).
+    4. Group detections by track_id into :class:`TrackedBox` rows.
+    5. Call :func:`build_windows_for_track` for each track.
+    6. For each emitted :class:`TrackWindow`, read the needed frames
+       from the local staged copy, apply :func:`compute_crop_geometry`
+       per frame + :func:`apply_crop_to_frame`, write each frame +
+       metadata into a shard via :class:`ShardWriter`.
+    7. Clean up the local staged copy on exit.
+    8. Record every skip reason in the run-level summary.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import re
+import shutil
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -95,6 +102,7 @@ class RunSummary:
     skip_reason_counts: dict[str, int] = field(default_factory=dict)
     shards_written: int = 0
     shard_clip_records: list[ShardClipRecord] = field(default_factory=list)
+    local_staging_root: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -191,12 +199,52 @@ class ClipRunOutcome:
     skipped_reasons: list[str] = field(default_factory=list)
 
 
+def _load_frames_from_local(
+    local_folder: Path,
+    source_folder: Path,
+    frame_indices: Iterable[int],
+) -> dict[int, np.ndarray]:
+    """Read frames from a local-disk staged folder keyed by ``frame_NNNNN.png``.
+
+    The local staged layout is a flat directory of
+    ``frame_00000.png, frame_00001.png, …`` produced by
+    :func:`stage_clip_frames_for_cropping`. We map frame_index →
+    ``frame_{index:05d}.png`` directly so we skip the discovery step.
+
+    If a frame_index is missing locally (gap), we fall back to a single
+    discovery-based lookup against the original source folder so the
+    caller still gets a frame instead of a missing-file crash. This is
+    defensive — proper local staging should always cover every index.
+    """
+    needed = sorted(set(frame_indices))
+    out: dict[int, np.ndarray] = {}
+    for index in needed:
+        candidate = local_folder / f"frame_{index:05d}.png"
+        path: Path | None = None
+        if candidate.is_file():
+            path = candidate
+        else:
+            # Fallback: discover in source folder. Useful when a frame
+            # was missing locally but present on Drive (or vice-versa).
+            from perception.frames import discover_frames
+            for record in discover_frames(source_folder):
+                if record.index == index:
+                    path = record.path
+                    break
+        if path is None:
+            continue
+        out[index] = np.array(Image.open(path).convert("RGB"))
+    return out
+
+
 def _load_frames(folder: Path, frame_indices: Iterable[int]) -> dict[int, np.ndarray]:
-    """Read only the frames the window actually needs.
+    """Read frames directly from a folder on Drive (legacy path).
 
     Issue 002's structured tracks carry frame indices, not paths, so
     we read the specific frames instead of the whole sequence. Saves
-    I/O when a track has gaps.
+    I/O when a track has gaps. **Prefer** :func:`_load_frames_from_local`
+    on real Colab runs — this function reads from Drive directly and
+    triggers the small-file I/O bottleneck.
     """
     from perception.frames import discover_frames
     frames = {frame.index: frame.path for frame in discover_frames(folder)}
@@ -207,6 +255,44 @@ def _load_frames(folder: Path, frame_indices: Iterable[int]) -> dict[int, np.nda
     return out
 
 
+def stage_clip_frames_for_cropping(
+    clip_id: str,
+    source_folder: Path,
+    local_root: Path,
+) -> tuple[Path, int]:
+    """Stage one clip's source frames to local disk for the cropping step.
+
+    Mirrors the perception runner's staging so cropping doesn't pay the
+    Drive FUSE small-file I/O cost. Returns ``(local_folder, frame_count)``.
+    Returns ``(source_folder, frame_count)`` if ``FALL_DETECTION_SKIP_LOCAL_STAGING``
+    is set (caller should treat the returned path as already-local).
+
+    Why a separate stager: the cropping step runs AFTER perception's
+    ``StagedClipContext`` has cleaned up its local copy, so we have to
+    re-stage. Reusing ``LocalFrameStager`` is possible but its
+    filename convention (``frame_NNNNN.png``) is exactly what we want
+    here, so we just call the lower-level helpers directly.
+    """
+    if os.environ.get("FALL_DETECTION_SKIP_LOCAL_STAGING"):
+        from perception.frames import discover_frames
+        return source_folder, sum(1 for _ in discover_frames(source_folder))
+
+    from perception.frames import discover_frames
+
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", clip_id) or "unnamed"
+    local_folder = local_root / f"crops_{safe}"
+    if local_folder.is_dir():
+        shutil.rmtree(local_folder, ignore_errors=True)
+    local_folder.mkdir(parents=True, exist_ok=True)
+
+    frame_count = 0
+    for record in discover_frames(source_folder):
+        destination = local_folder / f"frame_{record.index:05d}.png"
+        shutil.copy2(record.path, destination)
+        frame_count += 1
+    return local_folder, frame_count
+
+
 def _process_clip(
     clip_record: ClipRecord,
     boxes_by_track: dict[int, list[TrackedBox]],
@@ -214,11 +300,17 @@ def _process_clip(
     crops_root: Path,
     shard_padding: int,
     shard_index: int,
+    local_root: Path | None = None,
 ) -> tuple[ClipRunOutcome, int, ShardWriter]:
     """Process one clip end-to-end. Returns the outcome and a new shard index.
 
     All clips in one run land in the same shard (or rotate when the
     shard reaches a size budget). The caller owns the shard lifecycle.
+
+    If ``local_root`` is provided, the clip's source frames are copied
+    to ``<local_root>/crops_<clip_id>/`` BEFORE any frame reads, so the
+    runner avoids Drive FUSE small-file I/O. The local copy is removed
+    before returning so no stale frames leak into the next clip.
     """
     outcome = ClipRunOutcome(clip_record=clip_record, track_results=[])
 
@@ -226,66 +318,94 @@ def _process_clip(
     # can clamp boxes to the image before cropping.
     source_folder = crops_root.parent / clip_record.source_path
     from perception.frames import discover_frames
-    discovered = discover_frames(source_folder)
-    if not discovered:
-        outcome.skipped_reasons.append("empty_clip_folder")
-        return outcome, shard_index, _open_dummy_shard()
-    image_width, image_height = Image.open(discovered[0].path).size
 
-    # One shard per clip for simplicity; a real run can rotate shards
-    # when size budget is reached. We track shard_index in the caller.
-    shard_path = crops_root / shard_filename(shard_index, shard_padding)
-    writer = ShardWriter(shard_path, shard_index=shard_index)
-    writer.__enter__()
+    # Stage to local disk if requested. The function returns either the
+    # original source_folder (when skipping) or the staged local copy.
+    effective_source = source_folder
+    staged_local: Path | None = None
+    if local_root is not None:
+        staged_local, _ = stage_clip_frames_for_cropping(
+            clip_record.clip_id, source_folder, local_root,
+        )
+        # When staging is skipped (env var), staged_local == source_folder;
+        # otherwise it points at the fresh local copy.
+        effective_source = staged_local
 
-    for track_id, boxes in sorted(boxes_by_track.items()):
-        build = build_windows_for_track(track_id, boxes, crop_config)
-        outcome.track_results.append(build)
-        outcome.emitted_windows += build.emitted_count
-        for reason in build.skipped:
-            outcome.skipped_reasons.append(reason.reason)
-        for window in build.emitted:
-            # Read just the frames this window needs.
-            frames = _load_frames(source_folder, window.frame_indices)
-            if not frames:
-                outcome.skipped_reasons.append("frames_unreadable")
-                continue
-            for offset, (frame_idx, box) in enumerate(zip(window.frame_indices,
-                                                          window.boxes)):
-                if frame_idx not in frames:
-                    # Frame couldn't be loaded (gap in source folder);
-                    # emit a fully-padded placeholder so the clip length
-                    # contract holds.
-                    placeholder = np.zeros((image_height, image_width, 3),
-                                            dtype=np.uint8)
-                    frames[frame_idx] = placeholder
-                geometry = compute_crop_geometry(
-                    box.x_min, box.y_min, box.x_max, box.y_max,
-                    margin=crop_config.margin,
-                    image_width=image_width,
-                    image_height=image_height,
-                )
-                crop = apply_crop_to_frame(
-                    frames[frame_idx], geometry, output_size=crop_config.output_size,
-                )
-                meta = _metadata_for_frame(
-                    clip_record=clip_record,
-                    track_id=track_id,
-                    frame_index=frame_idx,
-                    frame_offset=offset,
-                    crop_config=crop_config,
-                    margin=crop_config.margin,
-                    missing=offset in set(window.missing_frames),
-                    coverage=window.coverage,
-                    shard_filename_str=shard_path.name,
-                )
-                writer.write_clip_member(
-                    f"{clip_record.clip_id}_t{track_id}_w{len(writer._clip_keys):03d}",
-                    frame_offset=offset,
-                    image=crop,
-                    metadata=meta,
-                )
-    return outcome, shard_index + 1, writer
+    try:
+        discovered = discover_frames(effective_source)
+        if not discovered:
+            outcome.skipped_reasons.append("empty_clip_folder")
+            return outcome, shard_index, _open_dummy_shard()
+        image_width, image_height = Image.open(discovered[0].path).size
+
+        # One shard per clip for simplicity; a real run can rotate shards
+        # when size budget is reached. We track shard_index in the caller.
+        shard_path = crops_root / shard_filename(shard_index, shard_padding)
+        writer = ShardWriter(shard_path, shard_index=shard_index)
+        writer.__enter__()
+
+        for track_id, boxes in sorted(boxes_by_track.items()):
+            build = build_windows_for_track(track_id, boxes, crop_config)
+            outcome.track_results.append(build)
+            outcome.emitted_windows += build.emitted_count
+            for reason in build.skipped:
+                outcome.skipped_reasons.append(reason.reason)
+            for window in build.emitted:
+                # Read just the frames this window needs. When we have a
+                # local staged folder, use the direct lookup path
+                # (cheaper than re-discovering the directory).
+                if staged_local is not None:
+                    frames = _load_frames_from_local(
+                        staged_local, source_folder, window.frame_indices,
+                    )
+                else:
+                    frames = _load_frames(source_folder, window.frame_indices)
+                if not frames:
+                    outcome.skipped_reasons.append("frames_unreadable")
+                    continue
+                for offset, (frame_idx, box) in enumerate(zip(window.frame_indices,
+                                                              window.boxes)):
+                    if frame_idx not in frames:
+                        # Frame couldn't be loaded (gap in source folder);
+                        # emit a fully-padded placeholder so the clip length
+                        # contract holds.
+                        placeholder = np.zeros((image_height, image_width, 3),
+                                                dtype=np.uint8)
+                        frames[frame_idx] = placeholder
+                    geometry = compute_crop_geometry(
+                        box.x_min, box.y_min, box.x_max, box.y_max,
+                        margin=crop_config.margin,
+                        image_width=image_width,
+                        image_height=image_height,
+                    )
+                    crop = apply_crop_to_frame(
+                        frames[frame_idx], geometry, output_size=crop_config.output_size,
+                    )
+                    meta = _metadata_for_frame(
+                        clip_record=clip_record,
+                        track_id=track_id,
+                        frame_index=frame_idx,
+                        frame_offset=offset,
+                        crop_config=crop_config,
+                        margin=crop_config.margin,
+                        missing=offset in set(window.missing_frames),
+                        coverage=window.coverage,
+                        shard_filename_str=shard_path.name,
+                    )
+                    writer.write_clip_member(
+                        f"{clip_record.clip_id}_t{track_id}_w{len(writer._clip_keys):03d}",
+                        frame_offset=offset,
+                        image=crop,
+                        metadata=meta,
+                    )
+        return outcome, shard_index + 1, writer
+    finally:
+        # Clean up the local staged copy so stale frames can't
+        # contaminate the next clip. Defensive: works even if the runner
+        # raised before getting here.
+        if staged_local is not None and staged_local != source_folder \
+                and staged_local.is_dir():
+            shutil.rmtree(staged_local, ignore_errors=True)
 
 
 def _open_dummy_shard() -> ShardWriter:
@@ -307,6 +427,7 @@ def run_cropping(
     crop_config: CropConfig | None = None,
     camera_filter: str = CAMERA_FILTER_DEFAULT,
     max_shards: int = 9999,
+    local_root: Path | None = None,
 ) -> RunSummary:
     """Run the full Issue 003 cropping pipeline.
 
@@ -321,6 +442,12 @@ def run_cropping(
         camera_filter: only process clips whose manifest notes carry
             this camera (default ``"cam0"`` per Issue 002 close-out).
         max_shards: upper bound for shard-name padding width.
+        local_root: if set, each clip's source frames are copied to
+            ``<local_root>/crops_<clip_id>/`` BEFORE crop building so
+            the runner reads from local disk instead of Drive FUSE.
+            Set ``FALL_DETECTION_SKIP_LOCAL_STAGING=1`` to skip even
+            when ``local_root`` is set (e.g. when running on a host
+            that already has fast disk access to the data).
 
     Returns:
         A populated :class:`RunSummary` describing what was processed.
@@ -334,6 +461,7 @@ def run_cropping(
         elapsed_seconds=0.0,
         crops_root=str(crops_root),
         crop_config=asdict(crop_config),
+        local_staging_root=str(local_root) if local_root is not None else None,
     )
 
     manifest = load_manifest(manifest_path)
@@ -370,6 +498,7 @@ def run_cropping(
             crops_root=crops_root,
             shard_padding=shard_padding,
             shard_index=next_shard_index,
+            local_root=local_root,
         )
         # Wire the per-clip windows into the live writer (which the
         # above already opened and wrote into). We rebuild the per-clip
