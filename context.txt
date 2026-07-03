@@ -290,6 +290,66 @@ Every skip is recorded in the run summary's `skip_reason_counts`.
 
 ---
 
+## Issue 002 runtime fix — local-disk frame staging
+
+### Root cause and symptom
+
+Live Issue 002 runs showed identical ~1.8 fps on L4 and A100 GPUs.
+The GPU was not the bottleneck — the runner was reading PNG frames
+one at a time directly from the mounted Google Drive (a FUSE
+filesystem). Drive small-file I/O is the documented bottleneck for
+this project (PRD: "small-file I/O from Drive is prohibitively slow")
+and FUSE reads can be cached arbitrarily, so the GPU sat idle
+waiting on every frame.
+
+### Fix
+
+Each clip's frames are copied from Drive to `/content/fall_detection_local/
+<clip_id>/` BEFORE tracking. The tracker reads from the local copy;
+only the project's artefact paths on Drive (`artifacts/perception/`,
+`logs/`) are written back. The raw dataset folder on Drive is never
+modified. After tracking, the local copy is removed automatically by
+the staging context manager so stale frames cannot contaminate the
+next clip.
+
+### Compute policy
+
+**Issue 002 perception should run on a T4** with local-disk frames.
+T4 + local disk is sufficient for YOLO26 + ByteTrack at
+production-relevant FPS. **A100 is reserved for compute-bound work**,
+especially VideoMAE fine-tuning in Issue 006 if it ends up needed.
+Running Issue 002 on A100 does not help — we observed identical
+~1.8 fps on both, because the bottleneck was I/O, not compute.
+
+The notebook records `GPU_NAME`, `RUNTIME_TYPE` (T4 / A100 / L4 /
+unknown), `torch.version.cuda`, and the local-staging root in the
+perception run summary JSON.
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `perception/local_staging.py` | New module: `LocalFrameStager`, `StagedClipContext`, `stage_clip_frames`. Per-clip copy with safe cleanup; numeric order preserved; source-Drive-unmodified guarantee. |
+| `tests/test_local_staging.py` | 11 new unit tests: numeric order preserved, stale frames removed between clips, source unmodified, skip-env-var path, empty clip, missing source frame, default root path, cleanup idempotence. |
+| `colab/002_perception_urfd.ipynb` | Run cell now stages each clip locally before tracking. Logs drive→local copy time + throughput, tracking runtime, total runtime, post-staging FPS. Records GPU / runtime type / CUDA version. Documents T4-for-perception policy. |
+| `context.txt` | This section. |
+
+### Verification results
+
+```
+$ python -m unittest discover tests
+Ran 180 tests in 3.521s — OK          # 169 prior + 11 new for local staging
+
+$ smoke test
+- numeric order preserved             : OK
+- stale frames removed between clips  : OK
+- source Drive folder unmodified      : OK
+- skip-env-var path                   : OK
+- default local root                  : /content/fall_detection_local
+```
+
+---
+
 ## Open issues / not yet addressed
 
 - **Track-through-fall has not been visually confirmed yet.** The
