@@ -300,6 +300,8 @@ def _process_clip(
     crops_root: Path,
     shard_padding: int,
     shard_index: int,
+    *,
+    layout_root: Path,
     local_root: Path | None = None,
 ) -> tuple[ClipRunOutcome, int, ShardWriter]:
     """Process one clip end-to-end. Returns the outcome and a new shard index.
@@ -311,12 +313,20 @@ def _process_clip(
     to ``<local_root>/crops_<clip_id>/`` BEFORE any frame reads, so the
     runner avoids Drive FUSE small-file I/O. The local copy is removed
     before returning so no stale frames leak into the next clip.
+
+    ``layout_root`` is REQUIRED: it's the root against which
+    ``clip_record.source_path`` resolves (the dataset/layout root, NOT
+    the crop artefact root). The previous code derived the source root
+    from ``crops_root.parent`` — that was wrong in any layout where the
+    dataset and the artefact root didn't share a parent (i.e. LOCAL
+    mode). Making the parameter explicit kills the ambiguity.
     """
     outcome = ClipRunOutcome(clip_record=clip_record, track_results=[])
 
     # Determine image dimensions from the first available frame so we
-    # can clamp boxes to the image before cropping.
-    source_folder = crops_root.parent / clip_record.source_path
+    # can clamp boxes to the image before cropping. Resolve the
+    # source folder against ``layout_root`` (the dataset root).
+    source_folder = layout_root / clip_record.source_path
     from perception.frames import discover_frames
 
     # Stage to local disk if requested. The function returns either the
@@ -498,6 +508,7 @@ def run_cropping(
             crops_root=crops_root,
             shard_padding=shard_padding,
             shard_index=next_shard_index,
+            layout_root=layout_root,
             local_root=local_root,
         )
         # Wire the per-clip windows into the live writer (which the

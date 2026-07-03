@@ -470,6 +470,81 @@ GPU runtime with Kaggle credentials configured. Expected outcomes:
 
 ---
 
+## Crop-stage path-resolution bug — fixed
+
+### Root cause (real-run crash)
+
+The first real Colab run of the cropping stage crashed because
+`cropping/runner.py:_process_clip` resolved source frames against
+the crop artefact root:
+
+```python
+source_folder = crops_root.parent / clip_record.source_path
+```
+
+This worked only when the dataset root and the crop artefact root
+shared a parent — i.e. legacy single-root Drive layouts. In
+LOCAL mode (Issue 002 → 003 → 005 bridge) the dataset root lives on
+the Colab local disk (`/content/fall_local/`) and the artefact root
+lives on Drive (`MyDrive/fall_detection/artifacts/crops`), so
+`crops_root.parent` was `/content/drive/MyDrive/fall_detection/artifacts`
+and the resolved path became the non-existent
+`<artifact_root>/artifacts/datasets/urfd/<clip>`.
+
+### Fix
+
+`layout_root` is now a REQUIRED keyword parameter on `_process_clip`
+and `run_cropping`. Source paths resolve against `layout_root /
+clip_record.source_path` — the dataset/layout root, NOT the artefact
+root. The previous `crops_root.parent` fallback has been removed:
+it was always wrong in any layout where the crop root sat under
+`artifacts/` (which is how `DriveLayout.ensure()` creates it).
+
+`run_cropping`'s signature already required `layout_root`, so the
+notebooks were already passing the right value — the bug was purely
+inside `_process_clip`. The notebooks needed no change.
+
+### Path contract (fixed)
+
+| Resolution target | Root |
+|---|---|
+| Source frames for cropping | `layout_root / clip_record.source_path` |
+| Per-clip local staging (when `local_root` set) | `<local_root>/crops_<clip_id>/` |
+| Crop shards | `crops_root / shard-NNNNNN.tar` |
+| Run summary | `crops_root / _run_summary.json` |
+
+In LOCAL mode:
+- `layout_root` = `/content/fall_local/` (datasets)
+- `crops_root` = `/content/drive/MyDrive/fall_detection/artifacts/crops/`
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `cropping/runner.py` | `_process_clip` now takes `layout_root: Path` as a required keyword argument and resolves `source_folder = layout_root / clip_record.source_path`. `run_cropping` threads it through. |
+| `tests/test_cropping_split_root.py` | New: 2 regression tests proving the split-root resolution works AND that the old `crops_root.parent` resolution would have failed. |
+| `context.txt` | This section. |
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 230 tests in 4.275s — OK          # 228 prior + 2 new for split-root regression
+
+$ python scripts/verify_notebook.py colab/000_full_pipeline.ipynb
+Local imports : OK (0 error(s))
+Status        : OK — notebook is ready for Colab
+```
+
+### Next action
+
+**Re-run only the crop cell.** Perception artefacts are unchanged
+on Drive; the bug was purely in path resolution. With this fix,
+re-running the crop stage on the existing perception artefacts
+should produce shards successfully.
+
+---
+
 ## First-class local-disk dataset mode (Issue 002 → Issue 003 → Issue 005 bridge)
 
 ### Root cause
