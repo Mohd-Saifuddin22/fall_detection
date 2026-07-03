@@ -100,6 +100,10 @@ APPROVED_PIP_PACKAGES: tuple[str, ...] = (
     # Used only by data/stage_urfd.py and only against Colab Secrets at
     # runtime; never invoked from inference or tracking code.
     "kagglehub",
+    # Issue 002 close-out — linear-assignment solver used by MOT metrics
+    # (TrackEval-style IDF1 / MOTA computation). Pinned here so future
+    # eval code can rely on it being importable without surprise.
+    "lap",
 )
 
 # TrackEval has no clean pip release; install from source. Listed separately

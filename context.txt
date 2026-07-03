@@ -8,18 +8,23 @@
 ## Current project state
 
 Phase I (Data Collecting & Processing) — Issue 001 foundation in place
-+ Issue 002 perception front-end in place.
++ Issue 002 perception front-end in place + Issue 003 crop clip
+generator in place.
 
 - Issue 001: Colab setup + role-locked dataset manifest (schema 1.1).
 - Issue 002: YOLO26 + ByteTrack perception front-end, fold-of-frames
   input contract, URFD staging script (Kaggle → Drive, credential-safe),
   URFD debug manifest builder, track-continuity / fragmentation report,
-  annotated-frame renderer.
+  annotated-frame renderer. Issue 002 close-out items landed.
+- Issue 003: deterministic crop clip generator consuming Issue 002
+  tracking artefacts, producing WebDataset-style .tar shards of
+  fixed-length person crops on Drive.
 
 Blockers for downstream issues:
-- Issue 003 (clip generator) is unblocked once Issue 002's
-  track-through-fall review passes on the debug tier.
-- All other issues (004-015) chain off 003 or later.
+- Issue 005 (Pipeline A data prep) and Issue 008 (Pipeline B data prep)
+  are unblocked now — both consume the same source frames and the same
+  manifest; only Issue 005 reads the Issue 003 shards.
+- Issue 004 (eval harness) can proceed in parallel.
 
 ---
 
@@ -191,6 +196,100 @@ the baseline real URFD result proves weak** (Issue 002 rule).
 
 ---
 
+## Completed work — Issue 003 + Issue 002 close-out
+
+### Issue 002 close-out
+
+- **URFD cam0 is the downstream path; cam1 is detection-limited.**
+  Recorded in the cropping runner's `camera_filter` default and in
+  this file. Cam1 stays as a hard slice for Issue 004's slice-based
+  evaluation but is NOT used to feed the classifier training pipeline.
+- **`lap` pinned** in both `requirements.txt` and
+  `colab/setup.py:APPROVED_PIP_PACKAGES`. Future eval code (Issue 004,
+  TrackEval-style) can rely on it.
+- **URFD folder-name " (1)" normalization.** `parse_urfd_folder_name`
+  strips the OS-collision suffix; `_enumerate_staged_clips` dedupes
+  on the normalized stem so re-staged data does not duplicate clips.
+- **`MAX_FRAMES_PER_CLIP` removed as a debug default** in the Issue 002
+  notebook. The cell now defaults to `None` (full-length) with a
+  comment explaining when to override.
+
+### Issue 003 — crop clip generator
+
+Deterministic, dataset-agnostic module that consumes Issue 002
+tracking artefacts and emits model-ready crop clips as WebDataset
+shards on Drive.
+
+#### Files created or changed
+
+| Path | Purpose |
+|---|---|
+| `cropping/clip_builder.py` | Pure crop math: expand → clip → square-pad → resize. No I/O. |
+| `cropping/track_windows.py` | Track → fixed-length windows; deterministic gap policy + min-coverage gate. |
+| `cropping/shard_writer.py` | WebDataset-style .tar shards with image + JSON sidecar + per-shard manifest. |
+| `cropping/runner.py` | End-to-end orchestration: load Issue 002 detections, filter to cam0, build windows, write shards, record run summary. |
+| `cropping/__init__.py` | Public surface. |
+| `tests/test_clip_builder.py` | 13 unit tests for crop math (margin, clipping, square+pad, resize, determinism). |
+| `tests/test_track_windows.py` | 12 unit tests for window building (empty/short tracks, gap policy, min-coverage gate, determinism). |
+| `tests/test_shard_writer.py` | 11 unit tests for the .tar writer (safe names, deterministic byte-equal shards, JPEG encoding). |
+| `colab/003_crop_clips.ipynb` | End-to-end Colab notebook: mount → resolve artefacts → configure crop → run cropping → verify shard round-trip. |
+| `data/stage_urfd.py` | Updated with " (1)" suffix normalization. |
+| `tests/test_urfd_staging.py` | Added 2 tests for the new normalization + dedupe. |
+| `context.txt` | This file. |
+
+#### Crop clip contract
+
+| Field | Default | Source of truth |
+|---|---|---|
+| `output_size` | 224 (px) | `CropConfig.output_size` |
+| `margin` | 0.30 (mid-range of PRD [0.20, 0.40]) | `CropConfig.margin` |
+| `clip_length` | 32 (PRD: 16 or 32) | `CropConfig.clip_length` |
+| `stride` | `clip_length` (non-overlapping) | `build_windows_for_track(stride=)` |
+| `gap_tolerance` | 4 consecutive missing frames | `build_windows_for_track(gap_tolerance=)` |
+| `min_box_area_px` | 32×32 = 1024 | `build_windows_for_track(min_box_area_px=)` |
+| `min_box_side_px` | 16 | `build_windows_for_track(min_box_side_px=)` |
+
+#### Short-track / gap / min-coverage policy
+
+- **Empty track:** skipped with reason `"empty_track"`.
+- **Track shorter than `clip_length`:** every candidate window is
+  dropped (consecutive missing frames exceed `gap_tolerance`); reason
+  `"too_many_gaps"`.
+- **Gap inside a window:** filled by carry-forward from the last
+  real box. The missing-frame slot carries a placeholder geometry
+  so downstream cropping still produces a uniform canvas.
+- **Gap run longer than `gap_tolerance`:** the entire window is
+  dropped with `"too_many_gaps"`.
+- **Tiny boxes (avg area < `min_box_area_px` OR median side <
+  `min_box_side_px`):** window dropped with `"insufficient_coverage"`.
+
+Every skip is recorded in the run summary's `skip_reason_counts`.
+
+#### Shard output format
+
+- Format: WebDataset-style `.tar` shards with one image + one JSON
+  metadata sidecar per frame.
+- Filename pattern: `shard-NNNNNN.tar` (zero-padded; padding width
+  computed deterministically from expected shard count).
+- Per-shard manifest: `_manifest.json` listing every member key and
+  every clip key written into the shard.
+- Output root: `MyDrive/fall_detection/artifacts/crops/`.
+- Per-frame metadata sidecar carries the full contract needed by
+  Pipeline A / B: `clip_id`, `dataset`, `label`, `source_path`,
+  `track_id`, `frame_index`, `frame_offset`, `missing_frame`,
+  `coverage`, `crop_config`, `margin_used`, `shard_filename`.
+
+#### Issue 003 determinism contract
+
+- Same input + same `CropConfig` → same crop pixels (byte-equal),
+  same metadata bytes, same shard names.
+- Provenance timestamps on every tar member are set to `mtime=0` so
+  the tar bytes are reproducible across runs.
+- WebDataset `cfg=` keys are not used here; the writer uses the
+  stdlib `tarfile` module and Pillow / OpenCV for JPEG encoding.
+
+---
+
 ## Open issues / not yet addressed
 
 - **Track-through-fall has not been visually confirmed yet.** The
@@ -339,6 +438,104 @@ start. If it fails (ID switches at the moment of collapse on most
 fall clips), apply fallback levers in order before retrying:
 `fallback_track_low_thresh=0.1` first, then `fallback_tracker='botsort.yaml'`,
 then `fallback_end2end=False` (manual).
+
+---
+
+## Issue 003 review corrections
+
+Issue 003 was code-complete but two correctness bugs surfaced under
+review that would have produced wrong crops in real Colab runs. Both
+are fixed; 169 tests pass.
+
+### 1. Edge-clipped crop geometry
+
+**Bug:** when the expanded bounding box extended past an image edge,
+`apply_crop_to_frame` sliced by `geometry.size` from `(x_min, y_min)` —
+which over-extended the slice into pixels outside the visible image.
+The bug only manifested on edge cases (a falling person near the
+frame boundary — exactly the case we care about), so the existing
+test suite missed it.
+
+**Fix:** `CropGeometry` now carries `clipped_width` and `clipped_height`
+fields explicitly. `square_with_padding` sets them to the actual
+clamped dimensions of the input box. `apply_crop_to_frame` slices by
+the clipped dimensions — never by `size` — so the slice is always
+the exact rectangle inside the image. The canvas is still
+`size × size` with symmetric pad bands on the un-clipped sides.
+
+**Test coverage** (`tests/test_clip_builder.py:EdgeClippedCropTests`):
+
+- `test_fully_in_bounds_box_unchanged` — regression guard for the
+  happy path.
+- `test_left_edge_clipped` — box runs off the left side.
+- `test_right_edge_clipped` — box runs off the right side.
+- `test_top_edge_clipped` — box runs off the top side.
+- `test_bottom_edge_clipped` — box runs off the bottom side.
+- `test_corner_clipped` — box runs off a corner (no pad needed).
+- `test_two_edges_clipped_with_pad` — one clipped side wider than the
+  other (real falling-person shape).
+- `test_no_garbage_source_pixels_pulled_in` — sentinel buffer past
+  the image edge; verifies the fix prevents the buggy slice from
+  leaking memory garbage into the crop.
+
+Each test asserts (a) the crop contains only pad + the expected
+white-box pixels (no garbage), and (b) the clipped region is actually
+narrower than the canvas when the box ran off an edge.
+
+### 2. `track_windows.__all__` phantom exports
+
+**Bug:** `track_windows.__all__` listed `MIN_BOX_AREA_PX`,
+`MIN_BOX_SIDE_PX`, and `GAP_TOLERANCE` — none of which were defined
+at module level. They were inlined as defaults in
+`build_windows_for_track`, not exported.
+
+**Fix:** removed the three phantom names from `__all__`. Cleaner than
+adding the constants at module level: they are implementation
+details of `build_windows_for_track`, not a public contract. Future
+callers who want to read the defaults continue to look at the
+function signature.
+
+### 3. Optional `min_coverage_fraction` gate
+
+**Status:** NOT applied. The existing `coverage` field on
+`TrackWindow` already records the fraction of real vs missing frames;
+the runner reads it for diagnostics. A separate `min_coverage_fraction`
+gate would duplicate this surface and force every caller to reason
+about two similar thresholds. Skipped per the optional / low-risk
+constraint.
+
+---
+
+## Issue 003 readiness
+
+Issue 003 is **code-complete** (169 tests pass). Closure depends on
+Issue 002 closing first (track-through-fall review on real URFD
+footage), AND on the new closure condition below.
+
+**Issue 003 closure condition:** a real Colab run over URFD cam0
+tracks must produce valid crop shards, AND a few crops must be
+human-reviewed visually. Open the shards at
+`MyDrive/fall_detection/artifacts/crops/` and inspect a handful of
+crops from each role (fall, no_fall) for correctness — the person
+should be visible and centred in the crop, not chopped off or
+shrunk to zero. This catches a class of issues unit tests cannot:
+detection / tracking output quality on real footage.
+
+**Issue 005 (Pipeline A data prep) readiness:** Unblocked. Pipeline A
+reads the Issue 003 shards directly; the `.meta.json` sidecar carries
+every field it needs (clip_id, dataset, label, track_id, frame_index,
+source_path, crop_config, margin_used, coverage).
+
+**Issue 008 (Pipeline B data prep) readiness:** Unblocked. Pipeline B
+operates on raw source frames + the manifest, not the Issue 003 shards
+(skeleton extraction is applied to per-person crops in a different
+shape). It shares the same source-frame contract as the perception
+front-end.
+
+**Issue 004 (eval harness) readiness:** Unblocked. Eval harness can
+start in parallel — it consumes Issue 002 tracking outputs and the
+golden-set / slice-based reporting rule, independent of Issue 003's
+shard format.
 
 ---
 

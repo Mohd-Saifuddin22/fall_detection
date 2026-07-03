@@ -28,3 +28,4 @@ omegaconf>=2.3.0            # Hydra-style configs
 pyyaml>=6.0.1               # Manifest loader
 tqdm>=4.66.0                # Progress bars
 kagglehub>=0.3.0            # Issue 002 — staged dataset fetch from Kaggle (creds via Colab Secrets)
+lap>=0.4.0                  # Issue 002 close-out — linear-assignment solver used by MOT metrics (TrackEval-style); pinned here so future eval code can rely on it

@@ -147,12 +147,28 @@ def parse_urfd_folder_name(folder_name: str) -> StagedClipFolder | None:
         ``fall-NN-camM``  →  fall sequence NN, camera M
         ``adl-NN-camM``   →  activities of daily living (non-fall), sequence NN, camera M
 
+    Folder names that OS-level re-stages have appended ``" (1)"`` /
+    ``" (2)"`` (Windows file-collision suffix) are normalised before
+    parsing so the dataset doesn't end up with two copies of the same
+    clip under different slugs. The returned ``folder_name`` is the
+    original name (preserving the on-disk path); the parsing logic
+    operates on the normalised stem.
+
     Returns ``None`` for folders that don't match — the caller decides
     whether to skip silently or warn.
     """
     lowered = folder_name.strip().lower()
     if not lowered:
         return None
+
+    # Strip an OS-level collision suffix: "fall-01-cam0 (1)" → "fall-01-cam0".
+    # We only strip when the suffix is exactly " (N)" where N is a
+    # small integer — anything more exotic (trailing spaces, unicode
+    # parens) is left alone so a real renaming is visible.
+    import re as _re
+    collision_match = _re.search(r"\s+\(\d+\)\s*$", lowered)
+    if collision_match is not None:
+        lowered = lowered[:collision_match.start()]
 
     label: str | None = None
     if lowered.startswith("fall-"):
@@ -283,8 +299,16 @@ def stage_urfd_from_kaggle(
 
 
 def _enumerate_staged_clips(staged_root: Path) -> tuple[StagedClipFolder, ...]:
-    """Walk the staged tree and parse each URFD-shaped folder."""
+    """Walk the staged tree and parse each URFD-shaped folder.
+
+    Deduplicates on the normalised name so ``fall-01-cam0`` and
+    ``fall-01-cam0 (1)`` (an OS-level file-collision suffix from
+    Windows re-stages) don't both appear in the manifest. The first
+    folder encountered in sorted order wins; the ``(N)`` suffix is
+    treated as a duplicate and skipped.
+    """
     clips: list[StagedClipFolder] = []
+    seen_normalised: set[str] = set()
     for entry in sorted(staged_root.iterdir()):
         if not entry.is_dir():
             continue
@@ -293,6 +317,16 @@ def _enumerate_staged_clips(staged_root: Path) -> tuple[StagedClipFolder, ...]:
         parsed = parse_urfd_folder_name(entry.name)
         if parsed is None:
             continue
+        # Normalise the folder name for dedup (same logic the parser
+        # applies) — case-insensitive stem, collision suffix stripped.
+        import re as _re
+        normalised = parsed.folder_name.strip().lower()
+        collision_match = _re.search(r"\s+\(\d+\)\s*$", normalised)
+        if collision_match is not None:
+            normalised = normalised[:collision_match.start()]
+        if normalised in seen_normalised:
+            continue
+        seen_normalised.add(normalised)
         clips.append(StagedClipFolder(
             absolute_path=entry,
             folder_name=parsed.folder_name,

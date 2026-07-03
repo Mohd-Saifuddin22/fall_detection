@@ -67,6 +67,19 @@ class ParseUrfdFolderNameTests(unittest.TestCase):
         self.assertEqual(parsed.label, "fall")
         self.assertEqual(parsed.camera, "cam0")
 
+    def test_os_collision_suffix_is_stripped(self) -> None:
+        # When a Windows file-collision re-stage produced "fall-01-cam0 (1)",
+        # the parser must still treat it as the same clip. The returned
+        # folder_name preserves the on-disk name; the parsed fields are
+        # based on the normalised stem.
+        parsed = parse_urfd_folder_name("fall-01-cam0 (1)")
+        assert parsed is not None
+        self.assertEqual(parsed.label, "fall")
+        self.assertEqual(parsed.camera, "cam0")
+        self.assertEqual(parsed.clip_sequence, "01")
+        # Original on-disk name preserved.
+        self.assertEqual(parsed.folder_name, "fall-01-cam0 (1)")
+
 
 class IsUrfdAlreadyStagedTests(unittest.TestCase):
     """Idempotency check for the staging script."""
@@ -108,6 +121,34 @@ class StageUrfdSlugTests(unittest.TestCase):
         # so we just confirm the slug check fires before any download.
         with self.assertRaises(RuntimeError):
             stage_urfd_from_kaggle(Path("/tmp"), kaggle_slug="something-else")
+
+
+class EnumerateStagedClipsTests(unittest.TestCase):
+    """The enumerator dedupes OS-collision-suffixed folders."""
+
+    def setUp(self) -> None:
+        from data.stage_urfd import _enumerate_staged_clips
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.staged = Path(self._tmp.name) / "datasets" / "urfd"
+        self.staged.mkdir(parents=True)
+        for name in ("fall-01-cam0", "fall-01-cam0 (1)", "fall-02-cam0", "adl-01-cam0"):
+            (self.staged / name).mkdir()
+        from data.stage_urfd import STAGING_MARKER_FILENAME
+        (self.staged / STAGING_MARKER_FILENAME).write_text("staged\n")
+        self._enumerate = _enumerate_staged_clips
+
+    def test_os_collision_suffix_is_deduplicated(self) -> None:
+        # "fall-01-cam0" and "fall-01-cam0 (1)" parse to the same clip;
+        # only one row should appear in the manifest.
+        clips = self._enumerate(self.staged)
+        folder_names = [c.folder_name for c in clips]
+        # The first in sorted order (the original, not the suffix) wins.
+        self.assertEqual(folder_names.count("fall-01-cam0"), 1)
+        self.assertNotIn("fall-01-cam0 (1)", folder_names)
+        # And the unrelated folders are still there.
+        self.assertIn("fall-02-cam0", folder_names)
+        self.assertIn("adl-01-cam0", folder_names)
 
 
 class BuildClipIdTests(unittest.TestCase):
