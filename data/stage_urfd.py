@@ -207,15 +207,23 @@ def parse_urfd_folder_name(folder_name: str) -> StagedClipFolder | None:
 
 
 def stage_urfd_from_kaggle(
-    drive_root: Path,
+    data_root: Path,
     *,
     kaggle_slug: str = ALLOWED_KAGGLE_SLUG,
     force: bool = False,
 ) -> UrfdStagingResult:
-    """Stage URFD into ``<drive_root>/datasets/urfd/``.
+    """Stage URFD into ``<data_root>/datasets/urfd/``.
+
+    The ``data_root`` is whichever root holds the ACTIVE processing
+    data — Drive in legacy mode, the Colab local disk in the
+    fast-path mode (``colab.data_mode.LOCAL``). The path the dataset
+    lands at is the same shape regardless of mode; the choice is
+    made by the caller, not this function.
 
     Args:
-        drive_root: project Drive root (``MyDrive/fall_detection/``).
+        data_root: root under which to stage URFD. In LOCAL mode this
+            is ``/content/fall_local``; in DRIVE mode it's the
+            project's Drive root (``MyDrive/fall_detection/``).
         kaggle_slug: dataset slug; defaults to the whitelisted
             ``tanmaydacha/urfd-dataset``. Any other value raises.
         force: when ``True``, re-download even if a staged copy exists.
@@ -236,7 +244,7 @@ def stage_urfd_from_kaggle(
             f"Only {ALLOWED_KAGGLE_SLUG!r} may be staged by this script."
         )
 
-    staged_root = Path(drive_root) / "datasets" / DATASET_SUBDIR_NAME
+    staged_root = Path(data_root) / "datasets" / DATASET_SUBDIR_NAME
 
     if not force and is_urfd_already_staged(staged_root):
         clips = _enumerate_staged_clips(staged_root)

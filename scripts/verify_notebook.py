@@ -103,6 +103,9 @@ class NotebookReport:
 def _resolve_local_module_path(module_name: str) -> Path | None:
     """Return the on-disk path of a local module, or ``None`` if external.
 
+    Handles both ``pkg.module`` (file) and ``pkg.subpkg`` (package
+    with ``__init__.py``) layouts.
+
     ``None`` distinguishes "this is a third-party import, leave it to
     pyflakes" from "this is a local module that doesn't exist on
     disk, which is a wiring bug". Callers that want the latter signal
@@ -114,10 +117,12 @@ def _resolve_local_module_path(module_name: str) -> Path | None:
     package_root = LOCAL_PACKAGE_ROOTS[parts[0]]
     if len(parts) == 1:
         return package_root / "__init__.py"
-    candidate = package_root.joinpath(*parts[1:]).with_suffix(".py")
-    if candidate.is_file():
-        return candidate
-    # Could also be a sub-package (rare for our project).
+    candidate_file = package_root.joinpath(*parts[1:]).with_suffix(".py")
+    if candidate_file.is_file():
+        return candidate_file
+    candidate_pkg = package_root.joinpath(*parts[1:]) / "__init__.py"
+    if candidate_pkg.is_file():
+        return candidate_pkg
     return None
 
 

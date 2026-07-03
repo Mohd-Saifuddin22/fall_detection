@@ -470,6 +470,117 @@ GPU runtime with Kaggle credentials configured. Expected outcomes:
 
 ---
 
+## First-class local-disk dataset mode (Issue 002 → Issue 003 → Issue 005 bridge)
+
+### Root cause
+
+Live runs with the manual hack
+``FALL_DETECTION_DRIVE_ROOT=/content/fall_local SKIP_LOCAL_STAGING=1``
+reduced runtime from ~30 minutes to ~2–4 minutes — confirming that
+**Google Drive small-file I/O is untenable** for active processing.
+The hack worked, but it was invisible to the notebooks themselves:
+users had to know to set the env vars, and there was no logging that
+confirmed the fast path actually fired.
+
+### Decision
+
+Local-disk dataset execution is now a **first-class pipeline mode**,
+not an env-var hack. A new module `colab.data_mode` exposes:
+
+- `DataMode.LOCAL` (default) — datasets land on the Colab local disk;
+  artefacts still land on Drive so they survive a runtime reset.
+- `DataMode.DRIVE` — legacy behaviour, both roots on Drive.
+- `resolve_data_layout(mode=...)` returns a :class:`DataLayout` with
+  separate ``dataset_root`` and ``artifact_root`` paths.
+- `layout.root` alias points at ``dataset_root`` so existing cells
+  that pre-date the data_mode split keep working unchanged.
+
+The notebooks now do:
+
+    DATA_MODE = DataMode(os.environ.get("FALL_DETECTION_DATA_MODE", "local").lower())
+    layout = resolve_data_layout(mode=DATA_MODE)
+
+…and log mode + both roots at the top so a human reviewer can confirm
+the fast path is firing. **No manual env-var hacking required** —
+users get the fast path by default. The opt-out
+``FALL_DETECTION_SKIP_LOCAL_STAGING=1`` is documented as a per-clip
+fine-grained escape hatch, not a prerequisite.
+
+### What runs where
+
+| Stage | In LOCAL mode reads from | Writes to |
+|---|---|---|
+| Stage URFD (Kaggle → disk) | Kaggle API | `dataset_root/datasets/urfd/` |
+| Perception run | `dataset_root/datasets/urfd/<clip>/` (after per-clip staging from there) | `artifact_root/artifacts/perception/<clip_id>/` |
+| Crop generation | same `dataset_root/datasets/urfd/<clip>/` (after per-clip staging) | `artifact_root/artifacts/crops/` |
+| Setup env lock | n/a | `artifact_root/artifacts/pip_freeze.txt` |
+| Run logs | n/a | `artifact_root/logs/` |
+| Metrics | n/a | `artifact_root/metrics/` |
+
+The Drive artefact path is unchanged from Issue 001 — the only
+change is WHERE the active pipeline READS frames from.
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `colab/data_mode.py` | New module: `DataMode` enum, `DataLayout` dataclass, `resolve_data_layout()` factory, `describe_layout()`, `select_active_paths()` helper. Default mode = `LOCAL`. |
+| `data/stage_urfd.py` | Renamed `drive_root` parameter → `data_root`. Behaviour unchanged; caller chooses Drive or local root. |
+| `colab/000_full_pipeline.ipynb` | Cell 2 now calls `resolve_data_layout(mode=DataMode.LOCAL)` and logs mode + both roots. All downstream cells use ``layout.root`` / ``layout.datasets`` (read) and ``layout.artifacts`` / ``layout.logs`` (write) consistently. |
+| `colab/002_perception_urfd.ipynb` | Same data-mode cell added. Perception reads from `layout.root`, writes artefacts to `layout.artifact_root`. |
+| `colab/003_crop_clips.ipynb` | Same data-mode cell added. Cropping reads from `layout.root`, writes shards to `layout.artifact_root`. |
+| `scripts/verify_notebook.py` | Fixed package-style module resolution (handles `pkg/sub/__init__.py`, not just `pkg/sub.py`). |
+| `tests/test_data_mode.py` | 24 new unit tests: enum stability, default mode, root resolution, mode override via env var, layout property paths, drive-mode collapse, `describe_layout` and `select_active_paths` output, signature contract on `stage_urfd_from_kaggle`. |
+| `context.txt` | This section. |
+
+### Verification results
+
+```
+$ python -m unittest discover tests
+Ran 228 tests in 4.030s — OK          # 204 prior + 24 new for data_mode
+
+$ python scripts/verify_notebook.py colab/000_full_pipeline.ipynb
+Local imports: OK (0 error(s))
+Pyflakes:     warnings (1 cell(s) with real pyflakes issues)
+Status:       OK — notebook is ready for Colab
+
+$ python scripts/verify_notebook.py colab/002_perception_urfd.ipynb
+Local imports: OK (0 error(s))
+Status:       OK — notebook is ready for Colab
+
+$ python scripts/verify_notebook.py colab/003_crop_clips.ipynb
+Local imports: OK (0 error(s))
+Status:       OK — notebook is ready for Colab
+```
+
+### Compute policy (unchanged)
+
+T4 for perception and crop generation; A100 reserved for compute-bound
+work (VideoMAE fine-tuning in Issue 006). LOCAL mode does not
+change this — local-disk frame reads just remove the I/O bottleneck.
+
+### Next validation step
+
+Run `colab/000_full_pipeline.ipynb` end-to-end on a T4 GPU runtime
+with:
+
+- `KAGGLE_USERNAME` and `KAGGLE_KEY` set in Colab Secrets
+- `FALL_DETECTION_DATA_MODE` unset (defaults to `local`)
+- `FALL_DETECTION_SKIP_LOCAL_STAGING` unset (defaults to off)
+
+Expected outcomes:
+
+- URFD lands in `/content/fall_local/datasets/urfd/` (LOCAL).
+- Perception artefacts land in
+  `MyDrive/fall_detection/artifacts/perception/<clip_id>/` (Drive).
+- Crop shards land in `MyDrive/fall_detection/artifacts/crops/` (Drive).
+- Per-clip FPS substantially higher than the pre-fix ~1.8 fps on L4/A100.
+- Once both the perception visual review (track-through-fall) and the
+  crop visual sanity check pass, Issues 002 and 003 close and Issue 005
+  can start.
+
+---
+
 ## Open issues / not yet addressed
 
 - **Track-through-fall has not been visually confirmed yet.** The
