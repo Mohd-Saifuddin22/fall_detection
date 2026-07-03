@@ -470,6 +470,63 @@ GPU runtime with Kaggle credentials configured. Expected outcomes:
 
 ---
 
+## URFD staging — read-only Kaggle source support
+
+### New Kaggle / Colab behaviour
+
+Newer Kaggle integrations expose datasets as a READ-ONLY mounted
+input directory (e.g. ``/kaggle/input/<dataset>``) rather than a
+writable cache at ``~/.cache/kagglehub/...``. The previous staging
+code used ``shutil.move`` to relocate entries from the Kaggle source
+into our staging root — that fails on a read-only mount (cross-device
+rename errors, and the source-cleanup path can't delete the source).
+
+### Fix
+
+`data/stage_urfd.py` now uses a new `_copy_into(source, destination)`
+helper that:
+
+- Reads bytes from the source.
+- Writes them into the destination via `shutil.copytree` (for dirs) or
+  `shutil.copy2` (for files).
+- **Never** deletes, renames, or otherwise mutates the source.
+
+The Kaggle source is now treated as a read-only input — regardless of
+whether the underlying mount is technically writable. The staging
+helper creates the destination's parent directory if missing so a
+single-file copy works without manual setup.
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `data/stage_urfd.py` | Replaced `shutil.move(...)` with `_copy_into(...)`. Added `_copy_into` helper (uses `shutil.copytree` for directories, `shutil.copy2` for files, creates parent dir if missing). Updated the top-level docstring + the inline comments that referenced the stale `~/.cache/kagglehub/...` cache path. |
+| `tests/test_stage_urfd_readonly_source.py` | New: 5 regression tests. (1) Full directory tree copies from a read-only source with byte-equal content + source untouched. (2) Single-file copy creates the destination's parent dir. (3) Patches `shutil.move` to raise; proves the helper never calls it. (4) Documents that pre-existing destinations raise (caller clears them first). (5) Pins the public-API contract: `stage_urfd_from_kaggle` source contains no `shutil.move`. |
+| `context.txt` | This section. |
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 236 tests in 5.147s — OK          # 231 prior + 5 new for read-only source
+
+$ python scripts/verify_notebook.py colab/000_full_pipeline.ipynb
+Local imports: OK (0 error(s))
+```
+
+### Colab flow after this lands
+
+1. Pull latest changes.
+2. Restart the Colab runtime (clears any stale `~/.cache/kagglehub/...`
+   state and any partial staging from a prior run).
+3. Run `colab/000_full_pipeline.ipynb` end-to-end.
+
+The staging step now works whether Kaggle returns a writable cache or
+a read-only mounted input directory — and never mutates the Kaggle
+source.
+
+---
+
 ## Crop shard finalization — fixed
 
 ### Root cause (crop data correct, shards unterminated)

@@ -4,11 +4,16 @@ Hard rules (Issue 002):
     - Read Kaggle credentials from Colab Secrets at runtime; never from
       files on disk, never as plaintext in this script, never as an
       environment variable the script prints.
-    - Download ONLY when ``MyDrive/fall_detection/datasets/urfd/`` does
-      not already exist. Re-runs must reuse the staged Drive copy.
+    - Download ONLY when the target staging path does not already exist.
+      Re-runs must reuse the staged copy (idempotency).
     - Never print, log, commit, or write credential values to Drive.
     - Never use a different Kaggle slug than ``tanmaydacha/urfd-dataset``
       (whitelisted here; everything else fails loud).
+    - **Never mutate the Kaggle source.** Kaggle / Colab may expose the
+      dataset as a read-only mounted input directory
+      (``/kaggle/input/<dataset>``) instead of a writable cache. We
+      COPY contents into the staging root, we do NOT move or rename.
+      See :func:`_copy_into`.
 
 Public API:
     - :func:`is_urfd_already_staged` — idempotency check.
@@ -271,9 +276,12 @@ def stage_urfd_from_kaggle(
             "running this staging script."
         ) from exc
 
-    # ``dataset_download`` returns the path to the downloaded folder on
-    # the local runtime (typically ``~/.cache/kagglehub/...``). We move
-    # its CONTENTS into the Drive staged root.
+    # ``dataset_download`` returns the path to the dataset source —
+    # historically a writable ``~/.cache/kagglehub/...`` cache, but newer
+    # Kaggle / Colab integrations may expose the dataset as a READ-ONLY
+    # mounted input directory (e.g. ``/kaggle/input/<dataset>``). We must
+    # NEVER delete, rename, or mutate that source — we only READ it and
+    # COPY its contents into our writable staged root.
     download_path = Path(kagglehub.dataset_download(kaggle_slug))
     if not download_path.is_dir():
         raise FileNotFoundError(
@@ -281,13 +289,14 @@ def stage_urfd_from_kaggle(
         )
 
     # kagglehub may nest the actual data one or two levels deep; pull
-    # the first directory contents up. We move everything; the marker
-    # file we write at the end proves provenance.
+    # the first directory contents up. We COPY everything (never move)
+    # so the Kaggle source remains untouched. The marker file we write
+    # at the end proves provenance.
     for entry in download_path.iterdir():
         destination = staged_root / entry.name
         if destination.exists():
             shutil.rmtree(destination)
-        shutil.move(str(entry), str(destination))
+        _copy_into(entry, staged_root / entry.name)
 
     # Write the provenance marker — proves this tree came from kagglehub,
     # not from a stray copy someone hand-placed.
@@ -343,6 +352,38 @@ def _enumerate_staged_clips(staged_root: Path) -> tuple[StagedClipFolder, ...]:
             clip_sequence=parsed.clip_sequence,
         ))
     return tuple(clips)
+
+
+# ---------------------------------------------------------------------------
+# Internal: read-only-safe copy
+# ---------------------------------------------------------------------------
+
+
+def _copy_into(source: Path, destination: Path) -> None:
+    """Copy ``source`` into ``destination`` without mutating ``source``.
+
+    Kaggle / Colab may mount the dataset as a READ-ONLY input directory
+    (``/kaggle/input/<dataset>``). We must never delete, rename, or
+    move anything there — we only READ its bytes and COPY them into
+    our writable staging root.
+
+    Behaviour:
+        - Source directory  → ``shutil.copytree(..., dirs_exist_ok=False)``
+          into ``destination``. ``dirs_exist_ok=False`` is the safer
+          choice: the caller (``stage_urfd_from_kaggle``) has already
+          cleared the destination if it existed.
+        - Source file       → ``shutil.copy2(...)`` (preserves mtime +
+          metadata so the destination is byte-faithful). The parent
+          directory of ``destination`` is created if needed.
+        - Symlinks          → preserved as-is so the destination tree
+          mirrors the source tree's structure.
+    """
+    if source.is_dir() and not source.is_symlink():
+        shutil.copytree(str(source), str(destination), symlinks=True)
+        return
+    # File (or a symlink — copy2 leaves symlink targets alone).
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(source), str(destination))
 
 
 __all__: tuple[str, ...] = (
