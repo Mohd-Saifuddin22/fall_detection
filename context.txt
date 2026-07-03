@@ -470,6 +470,91 @@ GPU runtime with Kaggle credentials configured. Expected outcomes:
 
 ---
 
+## Crop shard finalization — fixed
+
+### Root cause (crop data correct, shards unterminated)
+
+`run_cropping` discarded the `ShardWriter` returned by `_process_clip`
+and never registered it for final close. The `open_writers` /
+`_get_writer` plumbing was dead code (never called from the main
+loop). The final close loop iterated over an empty dict, so:
+
+- `_manifest.json` was never written (or was written empty).
+- `summary.shards_written` was always 0.
+- The tar files were left unterminated (writer entered via
+  `__enter__`, never exited).
+
+Crop *data* was being generated correctly — it was just never
+sealed into a usable shard.
+
+### Fix
+
+`_process_clip` already returns the real writer on the success path
+and a sentinel dummy (`/dev/null` writer, shard_index = -1) on the
+empty-clip fallback. The new `run_cropping` loop:
+
+1. Remembers the input shard index before calling `_process_clip`.
+2. Calls `_process_clip` and gets `(outcome, next_shard_index, writer)`.
+3. If `next_shard_index > pre_call_index` (real writer was created),
+   registers the writer in `open_writers[pre_call_index]` so the final
+   close loop can finalise it with its manifest.
+4. Skips registration if the dummy was returned (shard_index
+   unchanged, dummy points at `/dev/null`).
+
+The dead `_get_writer` function has been removed — there is exactly
+one writer per clip now (one writer per shard_index, created and
+closed around the clip that produced it).
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `cropping/runner.py` | `run_cropping` now registers real writers from `_process_clip` in `open_writers`. Dead `_get_writer` removed. The final close loop + `summary.shards_written = len(open_writers)` correctly counts the actual shard count. Plus a small `with Image.open(...) as probe:` fix to silence a ResourceWarning. |
+| `tests/test_run_cropping_end_to_end.py` | New: 1 end-to-end regression. Runs `run_cropping` on a real fixture, asserts windows emitted > 0, `shards_written` matches the real shard count, every shard tar contains a non-empty `_manifest.json`, and `read_shard()` round-trips the data. |
+| `context.txt` | This section. |
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 231 tests in 4.947s — OK          # 230 prior + 1 new for end-to-end
+
+$ python scripts/verify_notebook.py colab/000_full_pipeline.ipynb
+Local imports: OK (0 error(s))
+```
+
+### Next action
+
+**Re-run only the crop cell.** Perception artefacts on Drive are
+unchanged. With this fix, re-running the crop stage on the existing
+perception outputs should produce finalized, readable shards with a
+non-empty `_manifest.json` and accurate `shards_written`.
+
+---
+
+## Data-yield observation (non-blocking)
+
+On the most recent full real Colab run, **~26% of candidate
+windows were skipped with reason `too_many_gaps`**. This is a
+**data-yield note, not a bug fix**:
+
+- The gap tolerance in `build_windows_for_track` defaults to 4
+  consecutive missing frames inside a window. A window with more
+  than 4 consecutive gap frames is dropped.
+- The Issue 002 detections from URFD cam0 carry some gaps near
+  occlusion / fade-to-black transitions, so a non-trivial fraction
+  of windows get dropped.
+- This does not affect Issue 005 (Pipeline A) once we have enough
+  *surviving* windows per clip — but it caps the upper bound on
+  training-data yield.
+- Possible follow-ups (NOT in this task): widen `gap_tolerance`,
+  allow lower-quality windows via a `min_coverage_fraction` gate
+  (Issue 003 review flagged this as optional), or use ByteTrack's
+  high-confidence window (frames where the tracker reports high
+  association confidence). Defer until Issue 005 has hard numbers.
+
+---
+
 ## Crop-stage path-resolution bug — fixed
 
 ### Root cause (real-run crash)

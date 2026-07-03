@@ -346,7 +346,10 @@ def _process_clip(
         if not discovered:
             outcome.skipped_reasons.append("empty_clip_folder")
             return outcome, shard_index, _open_dummy_shard()
-        image_width, image_height = Image.open(discovered[0].path).size
+        # Read image dimensions via a context manager so the file handle
+        # closes deterministically — avoids ResourceWarning spam.
+        with Image.open(discovered[0].path) as probe:
+            image_width, image_height = probe.size
 
         # One shard per clip for simplicity; a real run can rotate shards
         # when size budget is reached. We track shard_index in the caller.
@@ -482,17 +485,10 @@ def run_cropping(
 
     shard_padding = compute_shard_padding_width(max_shards)
     next_shard_index = 0
+    # Map from shard_index → live ShardWriter. ``_process_clip`` opens
+    # the writer itself and hands it back; we register it here so the
+    # final close loop can finalise every shard with its manifest.
     open_writers: dict[int, ShardWriter] = {}
-
-    def _get_writer(shard_index: int) -> ShardWriter:
-        writer = open_writers.get(shard_index)
-        if writer is not None:
-            return writer
-        path = crops_root / shard_filename(shard_index, shard_padding)
-        writer = ShardWriter(path, shard_index=shard_index)
-        writer.__enter__()
-        open_writers[shard_index] = writer
-        return writer
 
     for clip in eligible_clips:
         detections_path = perception_root / clip.clip_id / f"{clip.clip_id}_detections.json"
@@ -503,7 +499,14 @@ def run_cropping(
         if not boxes_by_track:
             summary.clips_processed += 1
             continue
-        outcome, next_shard_index, _writer = _process_clip(
+        # ``_process_clip`` returns (outcome, next_shard_index, writer).
+        # On success, next_shard_index > input and writer is the real
+        # shard (opened via __enter__ inside _process_clip). On the
+        # empty-clip fallback path, next_shard_index == input and the
+        # writer is the dummy at /dev/null — we must NOT register that,
+        # otherwise we'd try to write a tar to /dev/null at close time.
+        pre_call_index = next_shard_index
+        outcome, next_shard_index, writer = _process_clip(
             clip, boxes_by_track, crop_config,
             crops_root=crops_root,
             shard_padding=shard_padding,
@@ -511,10 +514,13 @@ def run_cropping(
             layout_root=layout_root,
             local_root=local_root,
         )
-        # Wire the per-clip windows into the live writer (which the
-        # above already opened and wrote into). We rebuild the per-clip
-        # shard_clip_records from the track results since _process_clip
-        # may have rotated shards.
+        if next_shard_index > pre_call_index:
+            # Real shard was created; register its writer for final close.
+            open_writers[pre_call_index] = writer
+
+        # Build the per-clip summary records. ``next_shard_index - 1`` is
+        # the index of the shard we just produced (or ``pre_call_index``,
+        # which equals it when the real path ran).
         for build in outcome.track_results:
             summary.tracks_processed += 1
             summary.windows_emitted += build.emitted_count
