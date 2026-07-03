@@ -96,6 +96,10 @@ APPROVED_PIP_PACKAGES: tuple[str, ...] = (
     "omegaconf",
     "pyyaml",
     "tqdm",
+    # Issue 002 — dataset staging from Kaggle.
+    # Used only by data/stage_urfd.py and only against Colab Secrets at
+    # runtime; never invoked from inference or tracking code.
+    "kagglehub",
 )
 
 # TrackEval has no clean pip release; install from source. Listed separately

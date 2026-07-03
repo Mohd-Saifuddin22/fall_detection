@@ -48,6 +48,17 @@ datasets/
 *.npy
 *.npz
 
+# Model weights — downloaded by ultralytics / transformers / accelerate
+# into the local runtime. NEVER commit; the env lock captures versions
+# but the binary weights belong on Drive only (or not at all).
+*.pt
+*.pth
+*.onnx
+*.bin
+*.safetensors
+*.pkl
+*.joblib
+
 # Local secrets (defensive — none expected)
 .env
 *.local

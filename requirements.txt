@@ -14,7 +14,7 @@
 #     colab/setup.py:TRACKEVAL_INSTALL_NOTE for the manual install command.
 #   - pyyaml is required by the dataset manifest loader (data/manifests/__init__.py).
 
-ultralytics>=8.3.0          # YOLO family (front-end detection)
+ultralytics>=8.3.0          # YOLO family (front-end detection — yolo26m in 8.4+)
 transformers>=4.45.0        # HuggingFace — VideoMAE, ViTPose backbones
 accelerate>=1.0.0           # HF launcher; required by transformers training
 webdataset>=0.2.103         # Sharded dataset reader (Drive-cached crop clips)
@@ -27,3 +27,4 @@ motmetrics>=1.4.0           # MOT metrics (ID switches, IDF1, MOTA, HOTA)
 omegaconf>=2.3.0            # Hydra-style configs
 pyyaml>=6.0.1               # Manifest loader
 tqdm>=4.66.0                # Progress bars
+kagglehub>=0.3.0            # Issue 002 — staged dataset fetch from Kaggle (creds via Colab Secrets)

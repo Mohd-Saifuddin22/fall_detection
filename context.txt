@@ -7,257 +7,392 @@
 
 ## Current project state
 
-Phase I (Data Collecting & Processing) — Issue 001 foundation laid down
-and reviewed. Rev 2 corrections are in: leakage enforcement is now
-complete (clip_id + source_path + subject_id), schema is at 1.1 with
-slice tags, dataset staging rules are documented, and the repo is
-initialised in git.
+Phase I (Data Collecting & Processing) — Issue 001 foundation in place
++ Issue 002 perception front-end in place.
+
+- Issue 001: Colab setup + role-locked dataset manifest (schema 1.1).
+- Issue 002: YOLO26 + ByteTrack perception front-end, fold-of-frames
+  input contract, URFD staging script (Kaggle → Drive, credential-safe),
+  URFD debug manifest builder, track-continuity / fragmentation report,
+  annotated-frame renderer.
 
 Blockers for downstream issues:
-- Issue 002 (perception front-end / YOLO+ByteTrack) is unblocked.
-- All other issues (003-015) chain off 002 or later.
+- Issue 003 (clip generator) is unblocked once Issue 002's
+  track-through-fall review passes on the debug tier.
+- All other issues (004-015) chain off 003 or later.
 
 ---
 
-## Completed work — Issue 001 (rev 2)
+## Completed work — Issue 002
 
-Stand up a reproducible Google Colab environment and a leakage-safe,
-role-locked dataset manifest.
+Stand up the shared perception front-end that turns raw video (or a
+folder of ordered frames) into per-person tracks with stable IDs.
 
 ### Files created or changed
 
 | Path | Purpose |
 |---|---|
-| `colab/setup.py` | Reusable Python module: Drive layout, approved pip stack, `pip freeze` capture, JSON run-log capture. Importable from notebook or script. |
-| `colab/001_setup.ipynb` | Colab notebook orchestrating mount → install → Drive layout → env lock → run log. Idempotent. |
-| `requirements.txt` | Approved dependency stack. **Excludes `torch` and `torchvision` deliberately** — Colab ships a CUDA-matched build. |
-| `data/manifests/__init__.py` | Schema (enums, `ClipRecord`, `Manifest`), YAML/JSON loader, validator split into named per-rule functions. **Schema version 1.1.** |
-| `data/manifests/sample_manifest.yaml` | 15 placeholder clips exercising every role, every vault rule, and every slice tag. |
-| `data/README.md` | Dataset staging rules: where datasets live, store-once rule, vault hard wall, manifest path conventions, licensing policy. |
-| `tests/__init__.py` | Makes `tests/` a package for `python -m unittest`. |
-| `tests/test_manifest_validator.py` | **24** unit tests covering every validator rule. All pass. |
+| `colab/setup.py` | Added `kagglehub` to `APPROVED_PIP_PACKAGES`. No torch/torchvision changes. |
+| `requirements.txt` | Added `kagglehub>=0.3.0` lower bound. |
+| `perception/frames.py` | `FrameFolderReader` + numeric frame sort. |
+| `perception/tracker.py` | YOLO26 + ByteTrack wrapper; strict model check; fallback knobs. |
+| `perception/render.py` | Annotated-frame renderer (boxes + track IDs). |
+| `perception/report.py` | Track-continuity / fragmentation / ID-switch report. |
+| `perception/artifacts.py` | Per-clip JSON artefact writer. |
+| `perception/__init__.py` | Public surface. |
+| `data/stage_urfd.py` | URFD Kaggle staging script; credential-safe; idempotent. |
+| `data/build_urfd_manifest.py` | Walks staged URFD tree, emits schema-1.1 manifest. |
+| `data/manifests/urfd_debug_placeholder.yaml` | Placeholder manifest (4 clips) so the repo validates before URFD is staged. |
+| `data/README.md` | Added URFD-specific staging section + credential rule + honest-metric note. |
+| `colab/002_perception_urfd.ipynb` | End-to-end notebook: mount → install kagglehub → credentials → stage URFD → build manifest → run perception on every debug clip → write artefacts. |
+| `tests/test_frames.py` | 11 unit tests for the frame loader (numeric sort, ext filter, error paths). |
+| `tests/test_tracker.py` | 17 unit tests for the tracker wrapper (strict model check, kwargs, fallback knobs, flatten, summarise, FPS). |
+| `tests/test_report.py` | 12 unit tests for the report (segments, dominant-track timeline, ID switches, serialization). |
+| `tests/test_render.py` | 6 unit tests for the renderer (color mapping, copy-not-mutation, fallback color, degenerate box). |
+| `tests/test_urfd_staging.py` | 14 unit tests for the staging script + manifest builder + placeholder. |
 | `context.txt` | This file. |
-| `.gitignore` | Excludes `__pycache__`, heavy Colab outputs, raw dataset material. |
 
-### How to reproduce the Colab env
+### How to run the perception front-end
 
-1. Open `colab/001_setup.ipynb` in Colab.
-2. Run all cells. The notebook will:
-   - Mount Drive under `/content/drive`.
-   - Install the approved dependency stack via `setup.install_approved_packages()`.
-   - Verify Colab's torch is intact (CUDA available, cuDNN available).
-   - Create `MyDrive/fall_detection/{datasets,artifacts,checkpoints,metrics,logs}`.
-   - Write a literal `pip freeze` snapshot to `artifacts/pip_freeze.txt` on Drive.
-   - Write a JSON run log (timestamp UTC, GPU, VRAM, CUDA, Python, Drive paths) to `logs/setup_run_log.json` on Drive.
+In a Colab session with the `KAGGLE_USERNAME` / `KAGGLE_KEY` secrets set:
 
-### How to run the manifest validator
+1. Open `colab/002_perception_urfd.ipynb`.
+2. Run all cells. URFD is staged once; subsequent runs short-circuit.
+3. Annotated frames + per-clip reports land at
+   `MyDrive/fall_detection/artifacts/perception/<clip_id>/` on Drive.
+
+### How to run the validator + tests
 
 ```bash
-python -m unittest tests.test_manifest_validator -v
+python -m unittest discover tests -v
 ```
 
 ---
 
-## Issue 001 review corrections (this revision)
+## Issue 002 decisions and rules
 
-The following corrections were folded in after the first pass. Each one
-addresses a specific acceptance-criterion gap called out in the review.
+### 1. URFD source and staging
 
-### 1. Leakage enforcement is now complete
+- **Source.** `tanmaydacha/urfd-dataset` on Kaggle. Whitelisted in
+  `data/stage_urfd.py:ALLOWED_KAGGLE_SLUG`. Any other slug raises before
+  any network call.
+- **Destination.** `MyDrive/fall_detection/datasets/urfd/`.
+- **Idempotency.** A marker file `.staged_from_kaggle.txt` is written
+  on success; re-runs short-circuit. `force=True` overrides for the
+  rare case where the staged tree is corrupted.
+- **Provenance.** The marker records the slug and the credential source
+  ("colab_secrets") — never the credential values themselves.
 
-The previous train/validate disjointness check only triggered on
-duplicate `clip_id`. Two additional checks now run:
+### 2. Kaggle credential handling rule
 
-- **`_check_source_path_disjoint`** — train and validate must not share
-  the same `source_path`. Guards against the realistic failure mode where
-  two annotators assign different `clip_id`s to overlapping windows of
-  the same raw video.
-- **`_check_subject_id_disjoint`** — train and validate must not share
-  the same `subject_id` when one is set. Guards against subject-level
-  leakage where the model memorises person-specific cues instead of
-  learning the fall pattern.
+- **Read from Colab Secrets at runtime.** `KAGGLE_USERNAME` and
+  `KAGGLE_KEY` from `google.colab.userdata`.
+- **Never** print, log, return, commit, or write the values anywhere.
+  The staging script's only credential-aware code path sets two env
+  vars and returns; the values never leave the function.
+- **Local-dev fallback.** Outside Colab, the script looks for
+  `~/.kaggle/kaggle.json` on disk. We do NOT auto-create it.
+- **No fallback to env vars or files outside the two paths above.**
+  This keeps the credential surface tiny and auditable.
 
-Three new test classes exercise both rules: `SourcePathDisjointTests`,
-`SubjectIdDisjointTests`, plus the original `DisjointTrainValidateTests`
-for the duplicate-clip_id case.
+### 3. Folder-of-frames input contract
 
-**Caveat (open issue).** Subject-level leakage enforcement depends on
-real `subject_id` population quality. When subject_id is `None` on both
-sides of a comparison, the rule has nothing to compare and silently
-passes. The check is correct, but it cannot save a manifest whose
-authors forgot to populate subject_id. We will tighten this if / when
-dataset authors are willing to commit subject IDs at scale. (See the
-*Open issues* section below.)
+The tracker accepts an **ordered** iterable of frame paths:
 
-### 2. Optional slice tags added
+- The caller (the notebook / orchestrator) is responsible for ordering.
+- `FrameFolderReader` enforces numeric sort by trailing integer in the
+  filename stem (`frame_0001.png` → 1, `fall-01-cam0_frame_0042.png`
+  → 42). Non-numeric frames sort last by filename.
+- Out-of-order frames produce silently invalid tracks. The bug is
+  invisible until you visualise the annotated output. **Never bypass
+  the loader.**
 
-Four nullable fields were added to `ClipRecord` for Issue 004's
-slice-based evaluation:
+### 4. Numeric frame sorting requirement
 
-- `lighting` — one of `daylight` / `dim` / `low_light` / `mixed` / `unknown`
-- `occlusion` — one of `none` / `partial` / `heavy` / `unknown`
-- `multi_person` — bool
-- `action_confuser` — one of `none` / `sitting` / `sleeping` / `resting`
-  / `exercising` / `crawling` (sourced from PRD user stories 18 / 29)
+- Implemented in `perception/frames.py:discover_frames`.
+- Sort key: `(has_number_flag, trailing_integer, filename)`.
+- Frames with a trailing integer sort by that integer ascending.
+- Frames without one sort to the END (so they don't poison the start
+  of the timeline).
+- Ties on the integer (rare) are broken by full filename (lexical) for
+  determinism.
 
-Each value set is exposed as a frozen constant
-(`LIGHTING_VALUES`, `OCCLUSION_VALUES`, `ACTION_CONFUSER_VALUES`) so new
-buckets can be added in one line. Unknown values are **warnings**, not
-errors — researchers may legitimately need a new bucket, and adding one
-should not require a schema bump. Missing tags are not warned about:
-placeholder rows are legal until Issue 004 starts aggregating.
+### 5. YOLO26 + ByteTrack configuration
 
-The sample manifest demonstrates every tag on real rows so the schema
-is documented by example.
+| Knob | Value | Source of truth |
+|---|---|---|
+| `model_name` | `yolo26m` | `perception/tracker.py:REQUIRED_MODEL` |
+| `tracker_config` | `bytetrack.yaml` | `perception/tracker.py:REQUIRED_TRACKER` |
+| `persist` | `True` | (required for ByteTrack ID survival across frames) |
+| `classes` | `[0]` (person) | `perception/tracker.py:PERSON_CLASS_ID` |
+| `conf` | `0.25` | `TrackerConfig` default |
 
-### 3. Schema version bumped to 1.1
+**Hard rule:** any model name other than `yolo26m` raises
+`UnsupportedModelError`. No silent fallback to yolo11 / yolov8 / etc.
+Pretrained weights only — no training in this module.
 
-The loader now checks `schema_version` against `SUPPORTED_SCHEMA_VERSIONS`
-and rejects unknown versions loudly. Bumping the manifest without
-updating the loader is now a hard error, not a silent fall-through.
-Both `1.0` and `1.1` are accepted so old manifests keep loading.
+### 6. Metrics limitation due to missing ground truth
 
-### 4. Dataset staging documentation
+URFD ships with raw frames only — no detection or tracking labels.
+The report therefore does NOT compute mAP, IDF1, MOTA, or HOTA. They
+are recorded in `metric_availability` as:
 
-`data/README.md` covers the dataset-staging acceptance criterion in full:
+```python
+"map_50":     "n/a (no detection ground truth)"
+"map_50_95":  "n/a (no detection ground truth)"
+"idf1":       "n/a (no tracking ground truth)"
+"mota":       "n/a (no tracking ground truth)"
+"hota":       "n/a (no tracking ground truth)"
+```
 
-- Where each dataset lives on Drive (`datasets/<slug>/`).
-- **Store-once rule** — never re-download inside a Colab session.
-- **Frozen vault hard wall** — `omnifall`, `caucafall`, `mcfd`, `fallvision`
-  may only be staged under their own slugs and only referenced from
-  `frozen_unseen_test` manifest rows.
-- **Licensed / gated datasets** — manual staging only; no auto-fetch.
-- **Manifest paths must be Drive-relative**, not absolute.
-- **No raw material in git** — Drive is the data layer, git is the
-  source layer.
+Debug-tier validation is **annotated visual review** + the
+track-continuity / fragmentation report. The PRD already calls this
+out as the "cheapest killer risk to retire first" — track-through-fall
+must survive the fall motion itself.
 
-### 5. Version control readiness
+### 7. Fallback levers (apply only if the baseline fails)
 
-The repo was already initialised as git (per the host environment) but
-had zero commits. The initial commit `75c73e8` lands everything in
-`.gitignore`'s allow-list:
+In escalation order, exposed on `TrackerConfig`:
 
-- `colab/`, `data/`, `tests/`, `requirements.txt`, `context.txt`,
-  `issues/` (PRD + per-issue specs as reference).
-- All 24 tests pass at commit time.
+1. `fallback_track_low_thresh` — lower ByteTrack's association threshold
+   (e.g. `0.1`) so weak detections still get associated. **Auto-wired**
+   via Ultralytics ``cfg={"track_low_thresh": ...}`` — ByteTrack and
+   BoT-SORT both honour this key.
+2. `fallback_tracker='botsort.yaml'` — switch tracker config to BoT-SORT
+   (different association algorithm). **Auto-wired** via
+   ``tracker=`` arg.
+3. `fallback_end2end=False` — disable the BoT-SORT end-to-end pass.
+   **NOT auto-wired.** ``end2end`` is a model/runtime constructor arg of
+   the BoT-SORT class, not a tracker config key — it cannot be expressed
+   through ``model.track()``'s ``cfg=``. The field is kept on
+   ``TrackerConfig`` so the *intent* is recorded in ``run_meta.json``
+   (with the ``manual intervention required`` annotation); applying it
+   requires a manual code change.
 
-The `.gitignore` now explicitly excludes Colab-only outputs
-(`artifacts/pip_freeze.txt`, `logs/setup_run_log.json`) and raw
-dataset material (`*.mp4`, `*.tar`, `datasets/`, `artifacts/crops/`,
-`metrics/`, etc.). Those files are produced by the setup notebook
-inside a real Colab session on Drive and are intentionally **not**
-fabricated in this repo — when they exist they live on Drive, not
-locally.
+Whichever lever was used is recorded in ``run_meta.json`` as
+``fallback_used``. Auto-wired levers appear bare; manual-only levers
+appear with the ``(manual intervention required)`` suffix so a human
+reviewer can tell at a glance what was actually applied.
 
----
+Default ``TrackerConfig()`` has every fallback set to ``None`` — the
+baseline is what runs by default. **Do not run fallback levers unless
+the baseline real URFD result proves weak** (Issue 002 rule).
 
-## Important decisions (carried forward from rev 1 + new in rev 2)
+### 8. URFD manifest shape
 
-1. **Clip-level role locking.** Every clip carries exactly one role.
-   Datasets may legitimately span multiple roles (Le2i and GMDCSA-24 are
-   documented as cross-listed), but each individual clip is unique and
-   single-roled.
-
-2. **Three-axis leakage enforcement.** Clip ID uniqueness + source_path
-   disjointness + subject_id disjointness across train and validate.
-   Plus the frozen-vault hard wall. These four rules together are the
-   only thing standing between honest cross-dataset numbers and a
-   misleading result.
-
-3. **Colab-compatible dependency stack.** Single source of truth at
-   `colab/setup.py:APPROVED_PIP_PACKAGES`, mirrored in `requirements.txt`.
-
-4. **No reinstall of Colab torch / torchvision.** Post-install sanity
-   check (CUDA + cuDNN availability) catches silent breakage.
-
-5. **Frozen unseen-test hard wall.** Vault datasets may ONLY appear in
-   `frozen_unseen_test`. The validator catches both directions.
-
-6. **Real `pip freeze` is the env lock.** Written by Colab to
-   `artifacts/pip_freeze.txt` on Drive.
-
-7. **TrackEval is not in the default install.** Documented in
-   `TRACKEVAL_INSTALL_NOTE`; manual install only.
-
-8. **Schema versioning is enforced, not assumed.** Unknown
-   `schema_version` is a hard error so the loader and manifest can't
-   silently drift.
-
-9. **Slice tags are advisory, not enforced.** Unknown values warn;
-   missing values don't warn. This keeps the validator permissive
-   during early data acquisition without letting typos hide.
-
-10. **Dataset staging lives on Drive, source lives in git.** Hard
-    rule documented in `data/README.md` and enforced by `.gitignore`.
+- Schema version: `1.1`.
+- All clips are `role: debug` (URFD is a debug-tier dataset).
+- Labels:
+  - `fall-NN-camM` → `fall`
+  - `adl-NN-camM` → `no_fall`
+- `source_path` is **Drive-relative**: `datasets/urfd/<folder_name>`.
+- `notes` carries `sequence=NN; camera=camM; frame-folder (PNGs)`
+  for downstream traceability.
 
 ---
 
 ## Open issues / not yet addressed
 
-- **Subject-level disjointness depends on real subject_id population quality.**
-  The check fires whenever two clips in different splits share a
-  `subject_id`. But if the manifest author leaves `subject_id=None` for
-  most clips, the check has nothing to compare and silently passes. We
-  will monitor the real population rate and either: (a) emit a warning
-  when a manifest has zero subject_ids on either side of a comparison,
-  or (b) require subject_id to be populated for vault-adjacent rows
-  before unlocking Issue 004's full evaluation. Decision deferred until
-  first real dataset acquisition.
-- **Real datasets are not yet acquired.** The `sample_manifest.yaml` is
-  placeholder. Real clip IDs, `source_path`s, and provenance will land
-  when issue 002/003 begin pulling data.
-- **Drive layout has no contents yet.** `MyDrive/fall_detection/` will be
-  empty until the notebook is first run in a real Colab session.
-- **GPU class is not pinned.** Setup captures whatever GPU Colab hands
-  the session. If Colab assigns a smaller GPU (or no GPU at all), the
-  downstream pipelines must degrade gracefully.
-- **TrackEval install is manual.** No automation; documented in
-  `TRACKEVAL_INSTALL_NOTE`.
-- **WebDataset shard format not yet chosen.** Issue 003 will pick the
-  shard naming / tar format. Setup just keeps the dependency available.
-- **No remote git host configured.** Initial commit is local only;
-  pushing to GitHub / GitLab is a separate step the project owner can
-  take when ready.
+- **Track-through-fall has not been visually confirmed yet.** The
+  perception front-end runs end-to-end and writes artefacts, but the
+  actual question — *does the falling person keep the same track_id
+  through the fall motion on real URFD footage?* — is a human review
+  question answered by opening the annotated frames on Drive. If the
+  answer is "no, ID switches happen at the moment of collapse on most
+  fall clips," we escalate via fallback levers before moving to Issue
+  003. **Decision deferred until a real Colab run is reviewed.**
+- **Issue 002 is NOT closed.** The code is complete and verified
+  (116 tests pass) but the closure condition is a real Colab run on at
+  least one `fall-*` URFD clip with human-reviewed annotated output
+  showing stable ID through the fall. Until that visual review passes,
+  Issue 002 stays in "code-complete, awaiting closure". See
+  *Issue 002 review corrections* below.
+- **mAP / IDF1 / MOTA / HOTA are not computable on URFD.** Recorded
+  as "n/a" rather than fabricated. When a dataset with tracking
+  ground truth arrives (none currently on the PRD list), Issue 004
+  eval harness can compute them.
+- **Real URFD has not been staged in this dev environment.** Only the
+  placeholder manifest and the staging script are in the repo. A real
+  Colab session needs to run `colab/002_perception_urfd.ipynb` once
+  with Kaggle Secrets configured.
+- **`MAX_FRAMES_PER_CLIP=120`** in the notebook is a debug-tier cap.
+  Raise it (or remove it) when the wiring is trusted and we want
+  full-length runs.
+- **Annotator hasn't run on the full URFD sequence set.** Real URFD
+  has 30 fall sequences × 2 cameras + 40 ADL sequences × 2 cameras.
+  The placeholder + test fixtures cover 4 sequences; the staged real
+  dataset will expand to the full set.
+- **Cross-listed URFD clips in train/validate.** URFD currently lives
+  only in `debug` per the Issue 001 manifest schema (URFD was listed
+  in the debug-tier decisions). If Issue 006/009 needs URFD for
+  training, that's a separate decision — Issue 001 review already
+  recorded "train/validate disjointness depends on real subject_id
+  population quality", and URFD lacks subject IDs entirely.
+
+---
+
+## Issue 002 review corrections
+
+Issue 002 was code-complete but the review surfaced five blockers that
+would have made the real Colab run fail or be unsafe. All five are
+fixed; the code is now ready for a real Colab validation pass.
+
+### 1. Nested URFD frame layout
+
+URFD ships frames inside a wrapper folder::
+
+    fall-01-cam0-rgb/
+        fall-01-cam0-rgb/        <-- real frame folder
+            frame_0001.png
+            ...
+
+`discover_frames` now detects this layout via
+`_resolve_scan_folder` and descends into the single matching inner
+folder automatically. `describe_layout` reports the layout as
+`"flat"` or `"nested:<child>"` for diagnostic visibility. The numeric
+sort is preserved across both layouts.
+
+**Test coverage**: `test_urfd_nested_layout_descends_into_inner_matching_folder`,
+`test_urfd_nested_layout_does_not_descend_when_inner_has_no_frames`,
+`test_urfd_nested_layout_ignores_unrelated_subfolders`,
+`test_describe_layout_reports_urfd_nested`.
+
+### 2. Decode-failure observability
+
+`_flatten_result` used to silently return an empty list on any decode
+error — meaning a Ultralytics API change could produce a "successful"
+run with zero detections on every frame, and the report would have no
+idea anything was wrong.
+
+Now:
+- `_flatten_result` returns `(rows, decoded_ok)` — `decoded_ok=False`
+  signals that the result object couldn't be interpreted.
+- `run_tracker_on_folder` increments `result.decode_failures` on each
+  undecodable frame.
+- `decode_failures` is written into `run_meta.json` so a reviewer
+  reading the artefact sees the signal immediately.
+- A "decoded but no persons" frame still returns `(empty, True)` —
+  no detections on a clean frame is not the same as a decode failure.
+
+**Test coverage**: `test_filters_non_person_classes`,
+`test_missing_boxes_is_a_decode_failure_not_a_silent_zero`,
+`test_boxes_with_missing_attributes_is_a_decode_failure`,
+`test_boxes_with_no_persons_is_decoded_ok_with_empty_rows`,
+`test_decode_failures_appears_in_run_meta_artifact`.
+
+### 3. `.pt` gitignore protection
+
+`.gitignore` now excludes `*.pt`, `*.pth`, `*.onnx`, `*.bin`,
+`*.safetensors`, `*.pkl`, `*.joblib`. Model weights (including
+`yolo26m.pt`) downloaded by Ultralytics into the runtime cannot be
+committed. The env lock captures versions but not the binary weights.
+
+### 4. Dependency wiring confirmation
+
+`kagglehub` is wired in BOTH `requirements.txt` (line 30) AND
+`APPROVED_PIP_PACKAGES` in `colab/setup.py` (line 102). No reinstall
+of torch / torchvision. Confirmed by `grep` in this session.
+
+### 5. Fallback wiring corrected
+
+The previous wiring forwarded `end2end=False` through
+`cfg={"end2end": False}` — wrong, because `end2end` is a
+**model/runtime constructor argument** to BoT-SORT, not a tracker
+config key. The Ultralytics `cfg=` channel would have silently
+ignored it, leaving the human reviewer with a misleading
+"fallback applied" report.
+
+After the fix:
+- `fallback_track_low_thresh` is forwarded via
+  `cfg={"track_low_thresh": ...}` — correct, both ByteTrack and
+  BoT-SORT honour it.
+- `fallback_tracker='botsort.yaml'` is forwarded via the top-level
+  `tracker=` arg — correct.
+- `fallback_end2end` is **NOT auto-wired**. The field stays in
+  `TrackerConfig` so the *intent* is recorded in `run_meta.json`
+  with the suffix `(manual intervention required)`. Applying it
+  requires a manual code change (instantiating BoT-SORT directly).
+- Defaults are unchanged: every fallback is `None` by default.
+  **Do not run fallback levers unless the baseline real URFD result
+  is weak** — Issue 002 rule, now enforced at the default config
+  level.
+
+**Test coverage**: `test_end2end_is_NOT_auto_wired_via_cfg`,
+`test_end2end_alone_does_not_create_cfg`,
+`test_end2end_is_marked_as_manual_intervention`,
+`test_auto_wired_levers_appear_plain`.
+
+### 6. Issue 002 closure condition
+
+The remaining condition for closing Issue 002 is NOT code — it's a
+real Colab run:
+
+> Run `colab/002_perception_urfd.ipynb` end-to-end with real Kaggle
+> credentials on at least one `fall-*` URFD clip. Open the annotated
+> frames at
+> `MyDrive/fall_detection/artifacts/perception/<clip_id>/annotated/`
+> on Drive and visually verify that the falling person keeps the same
+> track_id through the fall motion.
+
+If that visual review passes, Issue 002 is closed and Issue 003 can
+start. If it fails (ID switches at the moment of collapse on most
+fall clips), apply fallback levers in order before retrying:
+`fallback_track_low_thresh=0.1` first, then `fallback_tracker='botsort.yaml'`,
+then `fallback_end2end=False` (manual).
 
 ---
 
 ## Assumptions
 
-- **Python 3.10+ on Colab.** Colab's current image ships 3.10 / 3.11.
-- **PyYAML is available.** It is in the approved stack and required by
-  the manifest loader. The loader surfaces a clear ImportError if missing.
-- **Drive mount succeeds.** If running outside Colab, `DriveLayout`
-  falls back to a local path via `FALL_DETECTION_DRIVE_ROOT`.
-- **`nvidia-smi` is on PATH inside the Colab runtime.** If not, the
-  run log records `gpu_name=null` rather than crashing.
-- **The dataset slugs in `IN_SCOPE_DATASETS` / `FROZEN_VAULT_DATASETS`
-  match the PRD.** Confirmed against `issues/prd.md` Phase I decisions.
-- **The `_DASH` convention for dataset slugs is stable.** Source files
-  use lowercase + underscores (`up_fall`, `caucafall`); the loader
-  normalises to lowercase so `URFD`, `urfd`, `UrFd` all parse identically.
-- **Local git commits only.** No remote is configured; `git push` will
-  fail until the owner wires one up. This is intentional and not a bug.
+- **ultralytics 8.4+** is installed in the runtime; `yolo26m` is
+  available. Verified against the dev environment in this session.
+- **PyYAML** is available for the manifest builder (in the approved
+  stack).
+- **Pillow** is available for the renderer (in the approved stack).
+- **kagglehub** reads `KAGGLE_USERNAME` / `KAGGLE_KEY` from env vars.
+  This is the documented contract.
+- **URFD PNG frames are named with a trailing integer** (e.g.
+  `frame_0042.png`). If a future URFD release changes naming, the
+  loader's regex may need to be widened — flagged for review.
+- **Colab Secrets are persistent across sessions for a given user.**
+  They are not stored on Drive.
 
 ---
 
-## File layout
+## File layout (after Issue 002)
 
 ```
 fall_detection/
-├── .gitignore                 # Excludes pycache, Colab outputs, raw data
+├── .gitignore                       # unchanged from Issue 001 rev 2
 ├── colab/
-│   ├── 001_setup.ipynb        # Colab setup notebook (run this first in Colab)
-│   └── setup.py               # Reusable helpers imported by the notebook
+│   ├── 001_setup.ipynb              # Issue 001
+│   ├── 002_perception_urfd.ipynb    # Issue 002 (new)
+│   └── setup.py                     # adds kagglehub
 ├── data/
-│   ├── README.md              # Dataset staging rules
+│   ├── README.md                    # adds URFD staging rules
+│   ├── stage_urfd.py                # new
+│   ├── build_urfd_manifest.py       # new
 │   └── manifests/
-│       ├── __init__.py        # Schema (v1.1), loader, validator
-│       └── sample_manifest.yaml # Placeholder manifest, validates cleanly
+│       ├── __init__.py              # schema 1.1, validator (Issue 001)
+│       ├── sample_manifest.yaml
+│       └── urfd_debug_placeholder.yaml   # new
+├── perception/                      # new — vertical slice for Issue 002
+│   ├── __init__.py
+│   ├── frames.py
+│   ├── tracker.py
+│   ├── render.py
+│   ├── report.py
+│   └── artifacts.py
 ├── tests/
 │   ├── __init__.py
-│   └── test_manifest_validator.py # 24 unit tests, all pass
-├── issues/                    # PRD + per-issue specs (reference)
-├── requirements.txt           # Approved dependency stack (no torch/torchvision)
-├── context.txt                # This file
-└── (log/checkpoint dirs created on Drive at runtime, never in git)
+│   ├── test_frames.py               # new
+│   ├── test_tracker.py              # new
+│   ├── test_report.py               # new
+│   ├── test_render.py               # new
+│   ├── test_urfd_staging.py         # new
+│   └── test_manifest_validator.py   # 24 tests, still green
+├── issues/
+├── requirements.txt                 # adds kagglehub
+├── context.txt                      # this file
+└── (Drive-only: datasets/urfd/, artifacts/perception/, etc.)
 ```

@@ -112,6 +112,7 @@ Current licensed datasets:
 
 | Slug | Source URL | License | Manual step required |
 |---|---|---|---|
+| urfd | `tanmaydacha/urfd-dataset` on Kaggle | (research-use) | Set `KAGGLE_USERNAME` + `KAGGLE_KEY` in Colab Secrets; staging is automated via `data/stage_urfd.py` |
 | up_fall | (publisher site) | (research-use) | Accept terms on publisher site |
 | omnifall | (publisher site) | (research-use) | Accept terms on publisher site |
 | caucafall | (publisher site) | (research-use) | Accept terms on publisher site |
@@ -169,6 +170,91 @@ Drive-relative paths let any session resolve them via the
 5. If the dataset is licensed or gated, add a row to the
    *Licensed datasets* table above.
 6. Update `context.txt` (decisions / open issues / assumptions).
+
+---
+
+## URFD — Issue 002 staging rules
+
+URFD is the first real dataset the project touches (Issue 002). It has
+its own staging rules on top of the generic rules above because it
+arrives as **ordered PNG frame folders**, not videos.
+
+### Where URFD lives on Drive
+
+```
+MyDrive/fall_detection/datasets/urfd/
+├── fall-01-cam0/                 # one folder per (sequence, camera)
+├── fall-01-cam1/
+├── adl-01-cam0/                  # ADL = activities of daily living (no fall)
+├── adl-01-cam1/
+├── ...
+├── .staged_from_kaggle.txt       # provenance marker
+└── manifest.yaml                 # auto-generated debug manifest (schema 1.1)
+```
+
+### Folder-name convention
+
+| Prefix | Role | Label |
+|---|---|---|
+| `fall-NN-camM` | debug | `fall` |
+| `adl-NN-camM`  | debug | `no_fall` |
+
+The trailing `-camM` is the camera index (URFD has two cameras per
+scene). The parser is case-insensitive and lives in
+`data/stage_urfd.py:parse_urfd_folder_name`.
+
+### Frame ordering — CRITICAL
+
+URFD PNG frames are named like `frame_0001.png`, `frame_0042.png`, etc.
+The tracker contract requires them in temporal order. Out-of-order
+frames produce silently invalid tracks (the bug is invisible until you
+visualise the annotated output).
+
+**Always sort numerically before tracking.** The loader does this for
+you — see `perception/frames.py:FrameFolderReader`. Do not bypass it.
+
+### How URFD gets there
+
+1. Add two secrets in Colab Secrets: `KAGGLE_USERNAME` and `KAGGLE_KEY`.
+   **Never** hardcode them, write them to disk, or commit them.
+2. Run `colab/002_perception_urfd.ipynb` step 4 — it calls
+   `data.stage_urfd.stage_urfd_from_kaggle(drive_root)`.
+3. The script downloads **only** from the whitelisted slug
+   `tanmaydacha/urfd-dataset`. Any other slug raises before any network call.
+4. On success, a `.staged_from_kaggle.txt` marker file is written so
+   re-runs short-circuit and never re-download.
+
+Future sessions must reuse the staged Drive copy — no re-downloads.
+
+### URFD credential rule
+
+- Credentials live in **Colab Secrets** (`KAGGLE_USERNAME`, `KAGGLE_KEY`).
+- The staging script reads them, sets two environment variables, and
+  returns. It never `print()`s the values, never writes them to a file,
+  never returns them from any function, never logs them.
+- The provenance marker file records only the **slug** and the source
+  ("colab_secrets"), not the credential values.
+- If you run outside Colab, the staging script looks for
+  `~/.kaggle/kaggle.json` on disk instead. We do NOT auto-create it.
+
+### Honest-metric note (URFD has no ground truth)
+
+URFD ships with raw frames only — no detection or tracking labels. The
+perception front-end therefore can NOT report mAP, IDF1, MOTA, or HOTA
+as numbers. The report records them as:
+
+```json
+{
+  "map_50":     "n/a (no detection ground truth)",
+  "idf1":       "n/a (no tracking ground truth)",
+  "mota":       "n/a (no tracking ground truth)",
+  "hota":       "n/a (no tracking ground truth)"
+}
+```
+
+Debug-tier validation is done by **annotated visual review** plus the
+track-continuity / fragmentation report. Per-clip annotated frames live
+at `artifacts/perception/<clip_id>/annotated/` on Drive.
 
 ---
 
