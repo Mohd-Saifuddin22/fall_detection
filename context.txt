@@ -2679,6 +2679,131 @@ build end-to-end because `existing_shards` is empty.
 
 ---
 
+## Issue 005 Step 1 — window-key bug fix + T-adaptive smoke check
+
+The Issue 005 smoke check immediately surfaced a window-key bug
+in the crop runner: the writer name used
+`f"{clip_record.clip_id}_t{track_id}_w{len(writer._clip_keys):03d}"`
+inside the per-frame loop. ``len(writer._clip_keys)`` is a
+*global* counter across all clips / tracks in a single shard —
+it does not reset at clip boundaries. Every clip past the first
+saw its windows numbered starting from the previous clip's
+window count. The smoke check could not load the second clip's
+windows because the keys it asked about did not exist on disk.
+
+### Corrected contract
+
+The crop runner now ``enumerate()``-s the emitted windows per
+track and computes the per-window key **once per window**:
+
+```python
+for window_index, window in enumerate(build.emitted):
+    clip_key = f"{clip_record.clip_id}_t{track_id}_w{window_index:03d}"
+    ...
+    for offset, (frame_idx, box) in enumerate(zip(window.frame_indices,
+                                                  window.boxes)):
+        ...
+        writer.write_clip_member(clip_key, ...)
+```
+
+`clip_key` is stable across all frames in one window AND resets
+to 0 at every clip / track boundary, so the per-window member
+stems on Drive are now what the Pipeline A loader groups on
+without manual fixup. ``window_index`` is also persisted on the
+per-frame metadata (``metadata["window_index"]``) for downstream
+provenance — a reviewer can recover a window's position without
+re-parsing the manifest.
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `cropping/runner.py` | ``_process_clip``: per-window key now computed once via ``enumerate``; ``len(writer._clip_keys)`` removed from the frame loop. ``_metadata_for_frame`` accepts and persists ``window_index``. |
+| `tests/test_run_cropping_window_key_invariant.py` | New end-to-end invariant test (`RunnerToLoaderInvariantTests` + `RunnerToLoaderInvariant16FrameTests` — 6 tests). Runs `run_cropping` against a synthetic 96-frame track, asserts the cross-module invariant at both `clip_length=32` and `clip_length=16`. |
+| `colab/000_full_pipeline.ipynb` | Smoke check now reads `clip_length` from sample shard metadata (`metadata["crop_config"]["clip_length"]`) and passes it as `T` to `load_clip_batch_from_shards`. Asserts `T ∈ ALLOWED_T`. No more reliance on `DEFAULT_T=16`. |
+| `context.txt` | This section. |
+
+### Cross-module invariant tests (`tests/test_run_cropping_window_key_invariant.py`)
+
+The test runs `run_cropping` against a synthetic 96-frame dense
+single-clip / single-track fixture at both `clip_length` values
+and asserts:
+
+1. The shard manifest's `clip_keys` count equals
+   `summary.windows_emitted` (one key per emitted window, not per
+   frame).
+2. Each emitted window has exactly `clip_length` member frames
+   with contiguous `frame_offset` values `0..clip_length - 1`.
+3. The Pipeline A loader (`load_clip_tensor_from_shards`) can
+   load each emitted window directly via its per-window member
+   stem with the matching `T` — proving the runner's output is
+   what the loader expects with **no manual key fixup**.
+
+The 16-frame variant subclasses the test and shrinks the
+expected tensor shape; both pass.
+
+### T-adaptive smoke check
+
+The Pipeline A cell at index 26 now reads the actual `T` from
+the sample shard rather than hard-coding `DEFAULT_T=16`:
+
+```python
+_sample_meta = next(iter(read_shard(shards[0]).metadata_members.values()))
+_T = int(_sample_meta["crop_config"]["clip_length"])
+assert _T in ALLOWED_T
+batch, clips = load_clip_batch_from_shards(shards, clip_keys=sample_keys, T=_T)
+```
+
+The cell reuses the `read_shard` import from cell 24 and the
+`shards` list from cell 22 — the only new top-level import is
+`ALLOWED_T` from `pipeline_a`. Smoke check continues to skip
+VideoMAE training and model metrics; the only output is the
+tensor contract assertion + the in-notebook normalisation
+parity check against the HF `VideoMAEImageProcessor`.
+
+### Regeneration instruction for broken Drive shards
+
+The crop shards currently on Drive were written by the buggy
+runner. Their per-window member stems are non-monotonic across
+clip boundaries, and the Pipeline A loader cannot load them.
+Existing tests still pass (they are unit tests over the loader
+or the writer in isolation) but a real-shard Pipeline A smoke
+check would silently fail to find windows.
+
+**Action for any existing Drive artefact set:**
+
+1. Set `FORCE_RECOMPUTE = True` in the new §1a config cell
+   (right after the data-mode cell).
+2. Run All.
+
+The config cell detects the existence of shards and refuses to
+reuse them when `FORCE_RECOMPUTE=True`, so a single Run All
+fans out through Issue 002 / Issue 003 and rebuilds every
+shard with the corrected per-window key. After the rebuild the
+smoke check picks up the fixed shards automatically.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 567 tests in 17.0s — OK    # 561 prior + 6 new for the invariant.
+
+$ python scripts/verify_notebook.py colab/000_full_pipeline.ipynb
+Notebook        : colab\000_full_pipeline.ipynb
+Local imports   : OK (0 error(s))
+Pyflakes        : warnings (1 cell(s) with real pyflakes issues)
+  cell 2        warning: 2 real issue(s)   # documented google.colab on non-Colab hosts
+Status          : OK — notebook is ready for Colab
+```
+
+`Status: OK` is the load-bearing gate; the cell-2 warning is
+the documented `from google.colab import drive` noise on
+non-Colab hosts. The cell-26 warning that previously flagged
+a `read_videomae_constants` cell is gone — the T-adaptive cell
+removed the cross-cell `DEFAULT_T` reference.
+
+---
+
 ## File layout (after Issue 002)
 
 ```

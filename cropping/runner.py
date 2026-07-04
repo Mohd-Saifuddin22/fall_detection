@@ -157,13 +157,21 @@ def _metadata_for_frame(
     track_id: int,
     frame_index: int,
     frame_offset: int,
+    window_index: int,
     crop_config: CropConfig,
     margin: float,
     missing: bool,
     coverage: float,
     shard_filename_str: str,
 ) -> dict[str, object]:
-    """Build the per-frame metadata sidecar written into the shard."""
+    """Build the per-frame metadata sidecar written into the shard.
+
+    ``window_index`` is the position of the per-window member stem
+    within the track's emitted windows — ``0`` for the first
+    window, ``1`` for the second, etc. Carried on the sidecar
+    for downstream provenance so a reviewer can recover the
+    window's position without re-parsing the shard manifest.
+    """
     return {
         "clip_id": clip_record.clip_id,
         "dataset": clip_record.dataset,
@@ -172,6 +180,7 @@ def _metadata_for_frame(
         "track_id": track_id,
         "frame_index": frame_index,
         "frame_offset": frame_offset,
+        "window_index": window_index,
         "missing_frame": missing,
         "coverage": coverage,
         "crop_config": {
@@ -363,7 +372,18 @@ def _process_clip(
             outcome.emitted_windows += build.emitted_count
             for reason in build.skipped:
                 outcome.skipped_reasons.append(reason.reason)
-            for window in build.emitted:
+            # Enumerate windows so the per-window ``clip_key`` is
+            # stable across every frame in that window and resets
+            # at every track boundary (the previous code used
+            # ``len(writer._clip_keys)`` INSIDE the frame loop, which
+            # produced non-monotonically-numbered windows across
+            # clip / track boundaries within a single shard — a
+            # subtle leak detected by the Pipeline A loader's
+            # Issue 005 smoke check).
+            for window_index, window in enumerate(build.emitted):
+                clip_key = (
+                    f"{clip_record.clip_id}_t{track_id}_w{window_index:03d}"
+                )
                 # Read just the frames this window needs. When we have a
                 # local staged folder, use the direct lookup path
                 # (cheaper than re-discovering the directory).
@@ -399,6 +419,7 @@ def _process_clip(
                         track_id=track_id,
                         frame_index=frame_idx,
                         frame_offset=offset,
+                        window_index=window_index,
                         crop_config=crop_config,
                         margin=crop_config.margin,
                         missing=offset in set(window.missing_frames),
@@ -406,7 +427,7 @@ def _process_clip(
                         shard_filename_str=shard_path.name,
                     )
                     writer.write_clip_member(
-                        f"{clip_record.clip_id}_t{track_id}_w{len(writer._clip_keys):03d}",
+                        clip_key,
                         frame_offset=offset,
                         image=crop,
                         metadata=meta,
