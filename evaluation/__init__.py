@@ -1,9 +1,10 @@
-"""Evaluation harness public surface for Step 1 + Step 2 (Issue 004).
+"""Evaluation harness public surface for Step 1 + Step 2 + Step 3 (Issue 004).
 
 Re-exports contracts, the NotAvailable marker, the execution-context
-frozen-tier guard, the result-persistence stub, and the clip-level
-classification metrics bundle so notebooks and pipeline code can
-``from evaluation import ...`` without reaching into submodules.
+frozen-tier guard, the result-persistence stub, the clip-level
+classification metrics bundle, and the detector-of-the-detector
+self-test so notebooks and pipeline code can ``from evaluation
+import ...`` without reaching into submodules.
 
 Step 1 establishes:
 
@@ -23,7 +24,16 @@ Step 2 adds:
 - A clip-level classification metric bundle (accuracy, precision,
   recall, specificity, F1, AUC-ROC, AUPRC, confusion matrix)
   reported overall and per slice; sklearn-backed; configurable
-  operating threshold; honest ``NotAvailable`` semantics.
+  operating threshold; honest ``NotAvailable`` semantics including
+  degenerate-slice denominators (precision / recall / F1 / specificity
+  become NotAvailable when their denominator is zero).
+
+Step 3 adds:
+
+- A detector-of-the-detector self-test (``run_classification_self_test``)
+  that proves the Step 2 harness catches a shuffled-label corruption.
+  Synthetic baseline + deterministic seeded shuffles + injected
+  scorer hook so the test has teeth against a broken / lying harness.
 """
 
 from evaluation.contracts import (
@@ -68,6 +78,14 @@ from evaluation.metrics.classification import (
     SupportCounts,
     compute_classification_metrics,
 )
+from evaluation.self_test import (
+    SelfTestConfig,
+    SelfTestResult,
+    SyntheticClassificationSet,
+    build_synthetic_baseline,
+    run_classification_self_test,
+    shuffle_labels as shuffle_synthetic_labels,
+)
 
 __all__: tuple[str, ...] = (
     # contracts
@@ -107,5 +125,12 @@ __all__: tuple[str, ...] = (
     "SupportCounts",
     "SliceMetricReport",
     "compute_classification_metrics",
+    # detector-of-the-detector (Step 3)
+    "SelfTestConfig",
+    "SelfTestResult",
+    "SyntheticClassificationSet",
+    "build_synthetic_baseline",
+    "run_classification_self_test",
+    "shuffle_synthetic_labels",
 )
 

@@ -20,10 +20,10 @@ generator in place + Issue 004 Step 1 (eval harness foundation) in place.
   tracking artefacts, producing WebDataset-style .tar shards of
   fixed-length person crops on Drive.
 - Issue 004: eval-harness foundation (Step 1) + classification
-  metrics + slice-based reporting (Step 2) — data contracts,
-  `NotAvailable` marker, frozen-tier read guard, versioned result
-  persistence, sklearn-backed clip-level classification metrics.
-  Event metrics still pending (Step 3+).
+  metrics + slice-based reporting (Step 2) + detector-of-the-
+  detector self-test (Step 3). Step 3 proves the Step 2 harness
+  catches a shuffled-label corruption. Event metrics still
+  pending (Step 4+).
 
 Blockers for downstream issues:
 - Issue 005 (Pipeline A data prep) and Issue 008 (Pipeline B data prep)
@@ -665,6 +665,174 @@ Step-2 prior tests (`HandComputedMetricsTests`,
 `PairingAndEmptyTests`, `ContainerShapeTests`) all still pass —
 the original 35 tests were not weakened, just supplemented with
 5 new ones that target the degenerate-slice shape of the contract.
+
+---
+
+## Issue 004 Step 3 — detector-of-the-detector self-test
+
+The PRD's *Testing Decisions* require the eval harness to prove
+itself — "periodically inject a known-bad change ... and confirm
+the eval catches it". Step 3 builds the first such sentinel: a
+classification self-test that proves the Step 2 metrics bundle
+detects a shuffled-label corruption.
+
+### Files created
+
+| Path | Purpose |
+|---|---|
+| `evaluation/self_test.py` | Synthetic-baseline builder, deterministic label shuffler, injectable scorer hook, `SelfTestResult` shape, `run_classification_self_test` entry point. |
+| `tests/test_eval_self_test.py` | 24 unit tests: defaults, synthetic-baseline shape + determinism, shuffle correctness, healthy-run pass-criteria, broken-scorer teeth (with several constant-AUC values), SelfTestResult shape, top-level exports. |
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `evaluation/__init__.py` | Re-exports `SelfTestConfig`, `SelfTestResult`, `SyntheticClassificationSet`, `build_synthetic_baseline`, `run_classification_self_test`, `shuffle_synthetic_labels` (renamed to avoid the in-package name collision with `random.shuffle`). Updated module docstring to mention Step 3. |
+| `context.txt` | This section. |
+
+### Self-test API contract
+
+```python
+from evaluation import (
+    SelfTestConfig,
+    SelfTestResult,
+    SyntheticClassificationSet,
+    build_synthetic_baseline,
+    run_classification_self_test,
+    shuffle_synthetic_labels,
+)
+
+cfg = SelfTestConfig()                # deterministic defaults
+result: SelfTestResult = run_classification_self_test(cfg)
+# result.baseline_auc_roc           — float
+# result.shuffled_auc_roc_values    — tuple[float]
+# result.shuffled_auc_roc_mean      — float
+# result.degradation_margin         — float (baseline - shuffled_mean)
+# result.degraded                   — bool (pass-criteria all hold)
+# result.passed                     — bool (same as degraded; field
+#                                     exists for explicit semantics)
+# result.reason                     — str ("all checks passed" or a
+#                                     semicolon-joined list of
+#                                     which checks fired)
+# result.n_shuffles, margin,
+#   config_seed_base, healthy_auc_range,
+#   degraded_auc_range              — knobs echoed for traceability
+```
+
+`run_classification_self_test` accepts an optional
+``evaluate_metrics`` callable that defaults to the real
+`compute_classification_metrics`. Injecting an evaluator that
+ignores inputs and reports a constant AUC-ROC is how the test
+proves it has teeth.
+
+### Deterministic shuffle policy
+
+- Synthetic builder is seeded with ``config.seed_base`` via an
+  explicit ``random.Random(seed)``. No global RNG is consulted.
+- Shuffle ``i`` uses seed ``config.seed_base + i + 1`` (deterministic
+  and easy to reproduce — `SelfTestConfig.shuffled_seeds()` exposes
+  the exact list).
+- A single shuffle permutes labels and renames each label's
+  ``clip_id`` to the prediction's ``clip_id`` at the shuffled
+  index. Renaming ``clip_id`` is what actually corrupts the
+  ``(score, label)`` bond — without it, the metric bundle would
+  re-pair by ``clip_id`` and the shuffle would be a no-op.
+- ``n_shuffles = 8`` (default) keeps the mean non-flaky at the
+  default sample size; the test asserts the result is invariant
+  across two runs of the same config.
+- No floating-point variance: the exact same inputs go through
+  the exact same sklearn paths (no shuffling inside
+  `compute_classification_metrics`).
+
+### Default knob values
+
+| Knob | Default | Rationale |
+|---|---|---|
+| `n_samples` | 200 | Enough for stable AUC-ROC; runs in well under a second. |
+| `score_class_separation` | 0.6 | Yields a baseline AUC-ROC near 1.0 against the original labels. |
+| `positive_rate` | 0.4 | Slight fall imbalance — falls are intrinsically rare in this domain; the exact split keeps both AUC computations well-defined. |
+| `n_shuffles` | 8 | Stable mean without being slow. |
+| `seed_base` | 12345 | Arbitrary fixed seed. |
+| `margin` | 0.30 | Required baseline-vs-shuffled gap. |
+| `healthy_auc_range` | `(0.85, 1.001)` | Half-open upper bound — a constant 1.000 reading is acceptable. |
+| `degraded_auc_range` | `(0.4, 0.6)` | PRD's "approximately chance" band. |
+| `score_noise` | 0.10 | Per-clip score jitter (gaussian sigma). |
+
+### Pass criteria
+
+`passed = True` iff all three checks hold:
+
+1. ``healthy_auc_range[0] <= baseline_auc_roc < healthy_auc_range[1]`` — the
+   synthetic baseline is genuinely well-separated.
+2. ``degraded_auc_range[0] <= shuffled_mean <= degraded_auc_range[1]`` —
+   shuffled labels collapse the AUC toward chance.
+3. ``degradation_margin >= margin`` (default 0.30) — the gap between
+   baseline and shuffled is large enough that the harness clearly
+   noticed the corruption.
+
+Any failed check is appended to ``result.reason`` so a CI log
+points at the specific axis that failed.
+
+### Teeth (broken-scorer test)
+
+`tests/test_eval_self_test.py::BrokenScorerTests` injects a
+wrapper that runs the real metric bundle but overwrites every
+aggregate's AUC-ROC with a constant. For values ``{0.5, 0.7,
+0.95, 0.99, 1.0}`` the self-test consistently reports
+``passed = False`` and a precise ``reason`` string. That's the
+mechanism by which a broken downstream aggregator / scorer
+(silent always-great-AUC, corrupted label-pipe, etc.) trips the
+self-test rather than passing silently.
+
+### Extension seam (future sentinels — NOT implemented here)
+
+The same ``build synthetic → deterministic shuffle → real harness →
+sentinel metric → pass-criteria`` pattern extends to the rest of the
+PRD's self-test plan. The module docstring lists:
+
+- **Tracking sentinel:** synthetic ByteTrack output with injected
+  ID switches; sentinel metric is IDF1 / MOTA / HOTA on the
+  future event-metric bundle.
+- **Skeleton sentinel:** synthetic keypoint sequence with
+  degraded confidence; sentinel metric is missing-keypoint rate.
+- **Post-verification sentinel:** degraded fall score sequence;
+  sentinel metric is detection delay.
+
+A future ``run_<component>_self_test(...)`` function in this
+module (or a new ``evaluation/self_test/<component>.py``) mirrors
+the same shape: ``Synthetic<Component>`` builder + a deterministic
+corruption strategy + a sentinel reading + a
+``run_<component>_self_test`` orchestrator returning a
+``SelfTestResult``.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 435 tests in 6.5s — OK    # 411 prior + 24 new for Step 3
+
+$ python -c "from evaluation import run_classification_self_test; \
+              r = run_classification_self_test(); \
+              print(f'baseline={r.baseline_auc_roc:.3f} \
+                     shuffled_mean={r.shuffled_auc_roc_mean:.3f} \
+                     margin={r.degradation_margin:.3f} \
+                     passed={r.passed}')"
+baseline=1.000 shuffled_mean=0.526 margin=0.474 passed=True
+```
+
+Coverage cross-reference vs. the spec's required test cases:
+
+| Required case | Test |
+|---|---|
+| Baseline AUC-ROC is high | `SyntheticBaselineTests.test_baseline_auc_is_near_one` |
+| Shuffled mean collapses toward chance | `HealthyRunTests.test_shuffled_mean_is_in_chance_band`, `LabelShuffleTests.test_shuffle_changes_label_to_score_pairing` |
+| Baseline − shuffled mean ≥ margin | `HealthyRunTests.test_default_run_passes` (margin >= 0.30), `SelfTestResultShapeTests.test_margin_equals_baseline_minus_shuffled_mean` |
+| Broken scorer fails the self-test (teeth) | `BrokenScorerTests.test_constant_high_auc_scorer_fails_the_self_test`, `test_broken_scorer_baseline_matches_broken_value`, `test_perfectly_wrong_scorer_consistently_fails` |
+| Deterministic | `SyntheticBaselineTests.test_baseline_is_deterministic`, `LabelShuffleTests.test_shuffle_is_deterministic_per_seed`, `DeterminismTests.test_same_config_same_result`, `ConfigDefaultsTests.test_shuffled_seeds_are_sequential_from_seed_base` |
+| Typed result shape | `SelfTestResultShapeTests.test_carries_every_spec_field`, `test_shuffled_values_each_in_unit_interval`, `test_result_is_hashable_and_frozen` |
+| Top-level exports | `PublicExportTests.test_top_level_exports_exist`, `test_shuffle_synthetic_labels_alias_matches_module_symbol` |
+| Synthetic builder vs. real harness | `SyntheticBaselineTests.test_baseline_auc_is_near_one` runs `compute_classification_metrics` on the output of `build_synthetic_baseline`. The runner itself does the same. |
+| Average over multiple seeded shuffles | `HealthyRunTests.test_n_shuffles_per_shuffled_values_length_match`, `ConfigDefaultsTests.test_shuffled_seeds_are_sequential_from_seed_base` |
 
 ---
 
