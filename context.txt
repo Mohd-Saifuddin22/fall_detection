@@ -2804,6 +2804,132 @@ removed the cross-cell `DEFAULT_T` reference.
 
 ---
 
+## Verifier — AST syntax check
+
+### Bug description
+
+`scripts/verify_notebook.py` previously relied on pyflakes to
+catch malformed notebook code. Pyflakes' ``Reporter`` raises a
+``StopIteration`` after the first ``SyntaxError`` it sees — but
+when pyflakes is **not installed** (or installed at a version
+that handles SyntaxErrors differently), the audit silently
+passes broken cells. The audit's job is "fail loudly on real
+wiring bugs", and a cell with an unterminated string literal
+qualifies.
+
+Two compounding real-world cases:
+
+1. A future notebook edit introduces an unterminated string
+   in the Pipeline A smoke check. Pyflakes catches it — until
+   the audit is run on a host without pyflakes. The bug is
+   silent in the "without pyflakes" path.
+2. The audit's `errors` list groups findings by cell. Without
+   a syntax check, a broken cell produces zero findings and the
+   notebook prints "Status: OK" — making the issue invisible
+   until a real Colab run.
+
+### Syntax check contract
+
+A new layer 1 (`ast.parse` per code cell) sits in front of the
+existing local-import audit and pyflakes pass. It is the
+load-bearing gate:
+
+- **Independent of pyflakes.** A notebook with an unterminated
+  string literal always fails when pyflakes is missing.
+- **Per-cell reporting.** Each broken cell produces one
+  :class:`scripts.verify_notebook.CellFinding` whose
+  ``errors`` tuple contains a single ``SyntaxError`` message
+  with line and column number, the parser's own ``msg`` text,
+  and the offending source line. The output format matches the
+  existing two layers so the CLI summary is consistent.
+- **CLI exit code is non-zero** when any cell has a SyntaxError.
+  ``Status: OK — notebook is ready for Colab`` is forbidden when
+  a syntax check fires.
+- **Existing behaviour preserved.** The local-import audit and
+  the cross-cell ``undefined name`` warning surface — neither
+  is removed or changed in semantics.
+
+Implementation:
+
+```python
+def _check_cell_syntax(source: str) -> list[str]:
+    """Return one error string per Python SyntaxError in ``source``.
+
+    Uses ``ast.parse`` (stdlib) so the check works even when
+    pyflakes is not installed.
+    """
+    import ast
+    try:
+        ast.parse(source, filename="<notebook-cell>")
+        return []
+    except SyntaxError as exc:
+        line = exc.lineno or 0
+        col = exc.offset or 0
+        bad_line = (exc.text or "").rstrip("\n")
+        msg = (
+            f"Python SyntaxError at line {line}, col {col}: "
+            f"{exc.msg}"
+        )
+        if bad_line:
+            msg += f"  (line: {bad_line.rstrip()!r})"
+        return [msg]
+```
+
+### Regression test coverage (`tests/test_verify_notebook.py`)
+
+| Test | Coverage |
+|---|---|
+| `SyntaxCheckTests.test_clean_source_returns_no_errors` | Sanity: clean Python parses cleanly. |
+| `SyntaxCheckTests.test_unterminated_string_raises` | The brief's headline case — unterminated string produces one error. |
+| `SyntaxCheckTests.test_missing_colon_raises` | `def f()` (no colon) is a SyntaxError. |
+| `SyntaxCheckTests.test_invalid_indent_raises` | `def f():\n    return 1\n  pass\n` produces an `IndentationError`. |
+| `SyntaxCheckTests.test_bracket_mismatch_raises` | `(1, 2` (unclosed tuple) is a SyntaxError. |
+| `AuditNotebookSyntaxFailTests.test_unterminated_string_fails_audit` | End-to-end: an unparseable cell flips `report.is_clean` to `False`; the finding includes the cell index and a ``SyntaxError`` message. |
+| `AuditNotebookSyntaxFailTests.test_mixed_clean_and_broken_cell_still_fails` | A clean sibling does NOT cancel the failure — the SyntaxError finding still appears in `report.findings`. |
+| `AuditNotebookSyntaxFailTests.test_real_000_notebook_passes_syntax` | Belt-and-braces: the project's own notebook has zero SyntaxError findings. Any future edit that introduces malformed Python trips this test. |
+| `VerifyNotebookCLITests.test_cli_returns_nonzero_for_unterminated_string` | The CLI exits non-zero on an unparseable cell, regardless of pyflakes availability. |
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `scripts/verify_notebook.py` | Added the `_check_cell_syntax` helper. Wired into `audit_notebook` so its findings land in the existing `CellFinding.errors` tuple. Module docstring updated to document the new layer. |
+| `tests/test_verify_notebook.py` | New `SyntaxCheckTests` (5 tests), `AuditNotebookSyntaxFailTests` (3 tests), and `test_cli_returns_nonzero_for_unterminated_string`. |
+
+### Audit-against-the-real-notebook check
+
+A helper loop runs ``_check_cell_syntax`` against every code
+cell in `colab/000_full_pipeline.ipynb`:
+
+```
+Total cells: 28
+Total cells with syntax errors: 0
+```
+
+Future notebook edits cannot silently introduce invalid
+Python — a single edit that breaks one cell fails the
+notebook verification immediately.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 576 tests in 14.0s — OK    # 567 prior + 9 new for syntax-check coverage
+
+$ python scripts/verify_notebook.py colab/000_full_pipeline.ipynb
+Local imports   : OK (0 error(s))
+Status          : OK — notebook is ready for Colab
+exit code: 0
+```
+
+`Status: OK` is now gated on three independent layers: AST
+syntax, the local-import audit, and pyflakes' optional pass.
+A future edit that introduces an unterminated string literal
+in any cell fails the CI before the notebook reaches Colab,
+regardless of which optional dependencies are installed.
+
+---
+
 ## File layout (after Issue 002)
 
 ```

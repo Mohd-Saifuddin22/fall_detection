@@ -21,6 +21,7 @@ from scripts.verify_notebook import (  # noqa: E402
     audit_notebook,
     audit_notebook as _audit,
     _audit_local_imports,
+    _check_cell_syntax,
     _module_exports,
     _resolve_local_module_path,
 )
@@ -224,6 +225,124 @@ class VerifyNotebookCLITests(unittest.TestCase):
             capture_output=True, text=True, cwd=_REPO_ROOT,
         )
         self.assertEqual(result.returncode, 2)
+
+    def test_cli_returns_nonzero_for_unterminated_string(self) -> None:
+        # The bug this guards against: pyflakes' ``SyntaxError`` is
+        # only raised when pyflakes is installed; if pyflakes is
+        # missing, the audit silently passes the broken cell. The
+        # AST check (independent of pyflakes) is the load-bearing
+        # gate.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            path = _make_notebook(tmpdir, [
+                {"cell_type": "code", "metadata": {}, "source": [
+                    "x = 'unterminated\n",
+                    "y = 1\n",
+                ]},
+            ])
+            result = subprocess.run(
+                [sys.executable, "scripts/verify_notebook.py", str(path)],
+                capture_output=True, text=True, cwd=_REPO_ROOT,
+            )
+            self.assertNotEqual(result.returncode, 0,
+                                 msg=f"stdout={result.stdout}")
+            self.assertIn("syntaxerror", result.stdout.lower())
+
+
+class SyntaxCheckTests(unittest.TestCase):
+    """AST parse catches malformed Python regardless of pyflakes."""
+
+    def test_clean_source_returns_no_errors(self) -> None:
+        self.assertEqual(_check_cell_syntax("x = 1\n"), [])
+        self.assertEqual(_check_cell_syntax("def f():\n    return 1\n"), [])
+        self.assertEqual(_check_cell_syntax(""), [])
+
+    def test_unterminated_string_raises(self) -> None:
+        errors = _check_cell_syntax("x = 'unterminated\n")
+        self.assertEqual(len(errors), 1)
+        self.assertIn("SyntaxError", errors[0])
+        self.assertIn("line", errors[0])
+
+    def test_missing_colon_raises(self) -> None:
+        errors = _check_cell_syntax("def f()\n    return 1\n")
+        self.assertEqual(len(errors), 1)
+
+    def test_invalid_indent_raises(self) -> None:
+        # Dedenting past the function body raises
+        # ``IndentationError: unindent does not match any outer
+        # indentation level`` (a subclass of SyntaxError).
+        src = "def f():\n    return 1\n  pass\n"
+        errors = _check_cell_syntax(src)
+        self.assertEqual(len(errors), 1)
+
+    def test_bracket_mismatch_raises(self) -> None:
+        errors = _check_cell_syntax("x = (1, 2\n")
+        self.assertEqual(len(errors), 1)
+
+
+class AuditNotebookSyntaxFailTests(unittest.TestCase):
+    """End-to-end: an unparseable cell fails ``audit_notebook``."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmpdir = Path(self._tmp.name)
+
+    def test_unterminated_string_fails_audit(self) -> None:
+        path = _make_notebook(self.tmpdir, [
+            {"cell_type": "code", "metadata": {}, "source": [
+                "x = 'unterminated\n",
+            ]},
+        ])
+        report = audit_notebook(path)
+        self.assertFalse(report.is_clean,
+                          msg=f"expected non-clean report; got findings: {report.findings}")
+        self.assertEqual(report.total_errors, 1)
+        finding = report.findings[0]
+        self.assertEqual(finding.cell_index, 1,
+                           msg=f"expected cell index 1, got {finding.cell_index}")
+        self.assertIn("SyntaxError", finding.errors[0])
+
+    def test_mixed_clean_and_broken_cell_still_fails(self) -> None:
+        # Cell 1 is clean; cell 2 has a SyntaxError. The audit
+        # surfaces cell 2 — the clean sibling does NOT cancel the
+        # failure.
+        path = _make_notebook(self.tmpdir, [
+            {"cell_type": "code", "metadata": {}, "source": [
+                "x = 1\n",
+                "_ = os  # use of os so pyflakes stops here\n",
+            ]},
+            {"cell_type": "code", "metadata": {}, "source": [
+                "y = 'broken\n",
+            ]},
+        ])
+        report = audit_notebook(path)
+        self.assertFalse(report.is_clean)
+        # Find the failing cell — the audit may also surface cell 1
+        # as a pyflakes warning (imported but unused). We only assert
+        # on the cell with a SyntaxError.
+        syntax_findings = [f for f in report.findings
+                           if any("SyntaxError" in e for e in f.errors)]
+        self.assertEqual(len(syntax_findings), 1)
+        self.assertEqual(syntax_findings[0].cell_index, 2,
+                          msg=f"expected cell 2 (overall index) to be the failure; got findings: {report.findings}")
+
+    def test_real_000_notebook_passes_syntax(self) -> None:
+        # Belt and braces — the project's own notebook must pass the
+        # AST syntax check. Any future edit that introduces malformed
+        # Python will surface here as a hard failure rather than
+        # during a real Colab run.
+        report = _audit(Path("colab/000_full_pipeline.ipynb"))
+        # All cells must be AST-parseable.
+        for index, cell in enumerate(report.findings):
+            for err in cell.errors:
+                self.assertNotIn(
+                    "SyntaxError", err,
+                    msg=(
+                        f"real notebook cell {index} has a SyntaxError — "
+                        f"audit_notebook must catch it.\n  err: {err}"
+                    ),
+                )
 
 
 if __name__ == "__main__":

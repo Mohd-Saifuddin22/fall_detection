@@ -1,16 +1,23 @@
 """Pre-Colab notebook verification.
 
 Catches import / wiring bugs in Jupyter notebooks BEFORE the notebook
-is opened in Colab. Two layers:
+is opened in Colab. Three layers:
 
-  1. **Static check** (pyflakes if available; fall back to a built-in
+  1. **AST syntax check** (``ast.parse`` per code cell). Independent of
+     pyflakes. A notebook with an unterminated string literal,
+     missing colon, or other Python syntax error fails verification
+     with a hard error and a non-zero CLI exit code. The ``Status``
+     line never reports ``OK`` when any cell does not parse.
+
+  2. **Static check** (pyflakes if available; fall back to a built-in
      import-pattern audit). Surfaces:
-        - undefined names referenced in cell code,
+        - undefined names referenced in cell code (warned),
         - imports from local modules that don't exist on disk,
         - imports from local modules whose target symbol doesn't
-          actually exist (we resolve against the repo's package layout).
+          actually exist (we resolve against the repo's package
+          layout).
 
-  2. **Import smoke-check**. For every ``from <local_module> import
+  3. **Import smoke-check**. For every ``from <local_module> import
      <symbol>`` we resolve the local module path on disk, then try to
      ``importlib.import_module`` it (after the repo root is on
      ``sys.path``). This catches the case where the module exists but
@@ -93,6 +100,40 @@ class NotebookReport:
         """Clean means zero ERRORS. Cross-cell-reference pyflakes warnings
         are expected in notebooks and do NOT fail the build."""
         return self.total_errors == 0
+
+
+# ---------------------------------------------------------------------------
+# AST syntax check (independent of pyflakes)
+# ---------------------------------------------------------------------------
+
+
+def _check_cell_syntax(source: str) -> list[str]:
+    """Return one error string per Python ``SyntaxError`` in ``source``.
+
+    The audit uses ``ast.parse`` (stdlib) so the check works even
+    when pyflakes is not installed. A SyntaxError is the
+    load-bearing gate — a notebook with an unterminated string
+    literal or missing colon cannot pass verification, regardless
+    of how clean the local imports are.
+    """
+    import ast
+
+    try:
+        ast.parse(source, filename="<notebook-cell>")
+        return []
+    except SyntaxError as exc:
+        line = exc.lineno or 0
+        col = exc.offset or 0
+        # exc.text contains the offending source line. Strip the
+        # trailing newline so the message stays one line.
+        bad_line = (exc.text or "").rstrip("\n")
+        msg = (
+            f"Python SyntaxError at line {line}, col {col}: "
+            f"{exc.msg}"
+        )
+        if bad_line:
+            msg += f"  (line: {bad_line.rstrip()!r})"
+        return [msg]
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +369,13 @@ def audit_notebook(nb_path: Path) -> NotebookReport:
         if not src.strip():
             continue
 
-        # ERRORS: real wiring bugs (caught by the local-import audit).
+        # ERRORS — Python syntax (AST parse, independent of pyflakes).
+        # These are reported as hard errors: a notebook cell that
+        # cannot parse fails verification no matter how clean its
+        # imports are.
+        syntax_errors = _check_cell_syntax(src)
+
+        # ERRORS — real wiring bugs (caught by the local-import audit).
         local_errors = _audit_local_imports(src)
 
         # WARNINGS: pyflakes issues minus cross-cell ``undefined name``.
@@ -337,11 +384,12 @@ def audit_notebook(nb_path: Path) -> NotebookReport:
         if pf_issue_count > 0:
             warnings.append(pf_detail)
 
-        if local_errors or pf_issue_count > 0:
+        all_errors = list(syntax_errors) + list(local_errors)
+        if all_errors or pf_issue_count > 0:
             report.findings.append(CellFinding(
                 cell_index=index,
                 cell_label=_cell_label(src),
-                errors=tuple(local_errors),
+                errors=tuple(all_errors),
                 warnings=tuple(warnings),
             ))
         # Track cells that had real (non-cross-cell) pyflakes issues
