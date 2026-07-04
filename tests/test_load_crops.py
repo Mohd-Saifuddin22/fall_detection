@@ -856,6 +856,248 @@ class ModuleSurfaceTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Regression: real-Issue-003 multi-window shards
+# ---------------------------------------------------------------------------
+
+
+def _write_multi_window_shard(
+    shard_path: Path,
+    *,
+    source_clip_id: str,
+    windows: Sequence[tuple[str, int, str, str, list[bool], list[float]]],
+) -> Path:
+    """Write one Issue 003-style shard with multiple windows of the same source.
+
+    Each entry of ``windows`` is::
+
+        (per_window_member_stem,
+         track_id,
+         label,
+         source_path,
+         missing_per_frame,
+         coverage_per_frame)
+
+    Every window's metadata sidecar carries the same
+    ``clip_id`` (the bare source) — this is the real Issue 003
+    layout: two windows from source ``"X"`` share the bare
+    metadata id ``"X"`` but write to two different tar member
+    stems (``"X_t7_w000_..."`` and ``"X_t7_w001_..."``).
+    """
+    shard_path = Path(shard_path)
+    with ShardWriter(shard_path, shard_index=0) as writer:
+        for window_stem, track_id, label, source_path, missing, coverage in windows:
+            for frame_offset in range(DEFAULT_T):
+                intensity = (sum(ord(c) for c in window_stem) + frame_offset) % 256
+                writer.write_clip_member(
+                    clip_key=window_stem,
+                    frame_offset=frame_offset,
+                    image=_rgb_frame(intensity, intensity // 2, intensity // 4),
+                    metadata=_frame_metadata(
+                        clip_id=source_clip_id, dataset="urfd",
+                        label=label, track_id=track_id,
+                        frame_index=200 + frame_offset,
+                        frame_offset=frame_offset,
+                        source_path=source_path,
+                        missing_frame=missing[frame_offset],
+                        coverage=coverage[frame_offset],
+                    ),
+                )
+    return shard_path
+
+
+class MultiWindowShardTests(unittest.TestCase):
+    """Real-Issue-003 multi-window shards: bare clip_id is shared.
+
+    Source clip ``"X"`` produces two windows:
+    ``"X_t7_w000"`` and ``"X_t7_w001"``. Both write
+    metadata sidecars with bare ``clip_id = "X"``. The OLD
+    loader grouped on bare ``clip_id``, merged both windows
+    into 32 frames, and raised ``InvalidClipLengthError``.
+    The corrected loader groups on the per-window member
+    stem and loads each window as its own 16-frame example.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp()
+        self.addCleanup(_rm_tree, Path(self._tmp))
+        self.shard_path = _write_multi_window_shard(
+            Path(self._tmp) / "shard-000000.tar",
+            source_clip_id="X",
+            windows=[
+                (
+                    "X_t7_w000", 7, FallLabel.FALL.value, "datasets/urfd/x.mp4",
+                    [False] * DEFAULT_T, [1.0] * DEFAULT_T,
+                ),
+                (
+                    "X_t7_w001", 7, FallLabel.FALL.value, "datasets/urfd/x.mp4",
+                    [False] * DEFAULT_T, [1.0] * DEFAULT_T,
+                ),
+            ],
+        )
+
+    def test_list_clip_keys_returns_per_window_stems_only(self) -> None:
+        # list_clip_keys reads the manifest — which the Issue 003
+        # writer populates with the per-window keys it actually
+        # accepted. No bare "X" should leak through.
+        keys = list_clip_keys(self.shard_path)
+        self.assertIn("X_t7_w000", keys)
+        self.assertIn("X_t7_w001", keys)
+        self.assertNotIn("X", keys,
+                         msg="list_clip_keys must not surface bare source clip_id.")
+
+    def test_each_window_loads_as_its_own_t_frames(self) -> None:
+        for window_key in ("X_t7_w000", "X_t7_w001"):
+            with self.subTest(window=window_key):
+                loaded = load_clip_tensor_from_shards(
+                    [self.shard_path], clip_key=window_key,
+                )
+                # Tensor + frames shape.
+                self.assertEqual(
+                    loaded.tensor.shape,
+                    (DEFAULT_T, NUM_CHANNELS, IMAGE_SIZE, IMAGE_SIZE),
+                )
+                self.assertEqual(
+                    loaded.frames.shape,
+                    (DEFAULT_T, IMAGE_SIZE, IMAGE_SIZE, 3),
+                )
+                # Per-window identity vs bare source id.
+                self.assertEqual(loaded.clip_key, window_key)
+                self.assertEqual(loaded.clip_id, "X")
+
+    def test_windows_are_not_merged(self) -> None:
+        # Each window has different per-frame intensity
+        # (sum(window_stem ord) + offset). If the windows were
+        # merged, the union's frame_offsets would range 0..31
+        # and the count would exceed DEFAULT_T — raising
+        # InvalidClipLengthError. The point of the regression
+        # test: prove we get two clean 16-frame tensors.
+        a = load_clip_tensor_from_shards(
+            [self.shard_path], clip_key="X_t7_w000",
+        )
+        b = load_clip_tensor_from_shards(
+            [self.shard_path], clip_key="X_t7_w001",
+        )
+        # Frame 0 of each window is a different intensity.
+        self.assertFalse(
+            np.array_equal(a.frames[0], b.frames[0]),
+            msg="Loaded windows must not be the same byte sequence.",
+        )
+        # Each window's frame_offsets are 0..T-1.
+        self.assertEqual(a.frame_offsets, tuple(range(DEFAULT_T)))
+        self.assertEqual(b.frame_offsets, tuple(range(DEFAULT_T)))
+
+    def test_no_duplicate_offset_or_invalid_length_error_per_window(self) -> None:
+        # Sanity: loading either window independently does NOT
+        # raise a duplicate-offset or invalid-length error.
+        # Each window has exactly one frame per offset, so the
+        # loader's T-validations succeed.
+        for window_key in ("X_t7_w000", "X_t7_w001"):
+            with self.subTest(window=window_key):
+                loaded = load_clip_tensor_from_shards(
+                    [self.shard_path], clip_key=window_key,
+                )
+                self.assertEqual(
+                    loaded.frame_offsets, tuple(range(DEFAULT_T)),
+                )
+
+    def test_batch_loads_each_window_as_distinct_example(self) -> None:
+        # The regression test for the broader bug: the batch
+        # loader must produce B = 2 distinct examples, not 1
+        # merged one.
+        from pipeline_a import load_clip_batch_from_shards  # noqa: PLC0415
+        batch, clips = load_clip_batch_from_shards(
+            [self.shard_path],
+            clip_keys=["X_t7_w000", "X_t7_w001"],
+        )
+        self.assertEqual(batch.shape,
+                         (2, DEFAULT_T, NUM_CHANNELS, IMAGE_SIZE, IMAGE_SIZE))
+        self.assertEqual([c.clip_key for c in clips],
+                         ["X_t7_w000", "X_t7_w001"])
+        # And both examples are bare "X".
+        self.assertEqual([c.clip_id for c in clips], ["X", "X"])
+
+    def test_per_window_provenance_consistent(self) -> None:
+        # All frames in a window carry the same provenance.
+        # Since the writer built the metadata correctly, this
+        # passes — but it's the regression that catches a buggy
+        # loader that mixed window frames.
+        loaded = load_clip_tensor_from_shards(
+            [self.shard_path], clip_key="X_t7_w000",
+        )
+        self.assertEqual(loaded.dataset, "urfd")
+        self.assertEqual(loaded.label, FallLabel.FALL.value)
+        self.assertEqual(loaded.track_id, 7)
+        self.assertEqual(loaded.source_path, "datasets/urfd/x.mp4")
+
+
+class PrefixCollisionGuardTests(unittest.TestCase):
+    """Prefix-match guard: ``X_t7_w000`` must not capture ``X_t70_w000``.
+
+    Both windows are written into the same shard; their bare
+    metadata ``clip_id`` is identical (the source-clip id
+    collision is yet another reason grouping on bare ``clip_id``
+    is wrong). The trailing-underscore prefix
+    ``X_t7_w000_`` is the disambiguation; the brief spells out
+    the assert.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp()
+        self.addCleanup(_rm_tree, Path(self._tmp))
+        # Two windows whose member names share a stem prefix
+        # but differ in characters 4 / 7. The loader's prefix
+        # is ``safe(clip_key) + "_"``.
+        self.shard_path = _write_multi_window_shard(
+            Path(self._tmp) / "shard-prefix.tar",
+            source_clip_id="X",
+            windows=[
+                (
+                    "X_t7_w000", 7, FallLabel.FALL.value, "datasets/urfd/x.mp4",
+                    [False] * DEFAULT_T, [1.0] * DEFAULT_T,
+                ),
+                (
+                    "X_t70_w000", 70, FallLabel.NO_FALL.value, "datasets/urfd/x.mp4",
+                    [False] * DEFAULT_T, [1.0] * DEFAULT_T,
+                ),
+            ],
+        )
+
+    def test_loading_X_t7_w000_does_not_capture_X_t70_w000(self) -> None:
+        loaded = load_clip_tensor_from_shards(
+            [self.shard_path], clip_key="X_t7_w000",
+        )
+        # ``track_id`` matches the X_t7_w000 window (7), not the
+        # X_t70_w000 window (70). If the loader wrongly grabbed
+        # both windows, track_id consistency would still pass
+        # (because both share the bare clip_id), but coverage /
+        # missing-frame count would either round up to 32 frames
+        # or raise an InvalidClipLengthError — neither is what
+        # we want.
+        self.assertEqual(loaded.track_id, 7)
+        self.assertEqual(loaded.frame_offsets, tuple(range(DEFAULT_T)))
+        # And the second window still loads independently.
+        loaded_70 = load_clip_tensor_from_shards(
+            [self.shard_path], clip_key="X_t70_w000",
+        )
+        self.assertEqual(loaded_70.track_id, 70)
+        # Crucially: a different track_id proves the loader
+        # did NOT collapse the two windows into a single example.
+        self.assertNotEqual(loaded.track_id, loaded_70.track_id)
+
+    def test_loading_X_t7_w000_returns_only_its_own_frames(self) -> None:
+        # Sanity: a hand-computable frame-offset count check.
+        # If the prefix guard failed, the loader would assemble
+        # 32 frames, fail the count check, and surface
+        # InvalidClipLengthError. With the guard in place,
+        # only the 16 frames prefixed with ``X_t7_w000_`` are
+        # gathered and the window loads cleanly.
+        loaded = load_clip_tensor_from_shards(
+            [self.shard_path], clip_key="X_t7_w000",
+        )
+        self.assertEqual(loaded.tensor.shape[0], DEFAULT_T)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

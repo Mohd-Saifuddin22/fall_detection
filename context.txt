@@ -2465,6 +2465,119 @@ Additional cheap coverage:
 
 ---
 
+## Issue 005 Step 1 — loader grouping fix + full-pipeline notebook smoke check
+
+### Bug description
+
+The first cut of the Step 1 loader grouped frames by the bare
+``metadata["clip_id"]`` field. Real Issue 003 shards, however,
+store every window of one source clip under the **same bare
+``clip_id``** — only the **per-window member stem**
+(``<source>_t<track_id>_w<idx>``) distinguishes the windows.
+
+Effect: a two-window source ``"X"`` produced 32 frames under bare
+``"X"``; the loader assigned them all to one example; the
+``T``-validations then surfaced a hard ``InvalidClipLengthError``
+and the trainer was unusable on real shards. The test
+``tests/test_load_crops.py::test_window_count_validates_per_window``
+(renamed in the fix to ``MultiWindowShardTests`` /
+``PrefixCollisionGuardTests``) would have caught this — but the
+brief wired the fix before the regression test landed.
+
+### Corrected ``clip_key`` contract
+
+The contract is now spelled out on the module:
+
+> ``clip_key`` is the **per-window member stem** written by
+> Issue 003's runner — format ``<source_id>_t<track_id>_w<index>``
+> (e.g. ``"X_t7_w000"``). Two windows from the same source clip —
+> say ``"X_t7_w000"`` and ``"X_t7_w001"`` — share the same bare
+> ``metadata["clip_id"]`` (= ``"X"``) but have **different** tar
+> member stems. The loader groups frames by the per-window stem
+> (prefix match using ``safe_member_name(clip_key) + "_"``); the
+> bare source ``clip_id`` is preserved as ``LoadedClip.clip_id``
+> for downstream manifest / role joins but is never the grouping
+> key.
+
+### Implementation
+
+| File | Change |
+|---|---|
+| `pipeline_a/load_crops.py` | Grouping helper renamed ``_collect_frames_for_clip`` → ``_collect_frames_for_window`` and rewritten to match on tar member-name prefix ``safe_member_name(clip_key) + "_"`` (mirrors :meth:`cropping.shard_writer.ShardReadResult.clip_frames`). The trailing-underscore separator rejects windows whose names share a stem prefix. ``LoadedClip`` now exposes **both** ``clip_key`` (the per-window stem) and ``clip_id`` (the bare metadata source). Module docstring + loader docstring + batch-loader docstring updated to spell out the contract. |
+| `tests/test_load_crops.py` | Two new regression classes. |
+| `colab/000_full_pipeline.ipynb` | New markdown + code cells after the round-trip verification cell and before the `Done` section. The smoke check reads a small batch from the cached shards, asserts the tensor contract, and in-notebook asserts the local normalisation constants match the HF `VideoMAEImageProcessor` for ``videomae-base``. |
+| `scripts/pipeline_a_smoke_cells.json` | Source-of-truth JSON for the cells. Storing the cell source as JSON sidesteps Python string-escape fragility in the inject script. |
+| `scripts/inject_pipeline_a_smoke.py` | Idempotent migration script that loads the JSON, locates the round-trip + Done cells, and inserts the smoke check + renumbers Done to §13. |
+
+### Regression test coverage
+
+| Required case | Test |
+|---|---|
+| Real-Issue-003 multi-window shard (`"X"` source, `"X_t7_w000"` and `"X_t7_w001"` windows) | `MultiWindowShardTests.test_list_clip_keys_returns_per_window_stems_only` — `list_clip_keys` returns the per-window stems, not the bare source id. |
+| Each key loads as its own separate ``(16, 3, 224, 224)`` tensor | `MultiWindowShardTests.test_each_window_loads_as_its_own_t_frames` |
+| Windows are not merged | `MultiWindowShardTests.test_windows_are_not_merged` — pixel signatures differ |
+| No ``LookupError`` | `MultiWindowShardTests.test_per_window_provenance_consistent` |
+| No duplicate-offset or invalid-length error | `MultiWindowShardTests.test_no_duplicate_offset_or_invalid_length_error_per_window` |
+| Batch loader produces ``(2, 16, 3, 224, 224)`` for both windows | `MultiWindowShardTests.test_batch_loads_each_window_as_distinct_example` |
+| Prefix-collision guard: ``X_t7_w000`` must not capture ``X_t70_w000`` | `PrefixCollisionGuardTests.test_loading_X_t7_w000_does_not_capture_X_t70_w000` — different ``track_id`` values per loaded window prove the windows were not collapsed. |
+| Each window reports its own ``track_id`` / ``frame_offsets`` | `PrefixCollisionGuardTests.test_loading_X_t7_w000_returns_only_its_own_frames` |
+
+### Notebook smoke-check wiring
+
+The new cell at index 23 (markdown) + 24 (code) in
+`colab/000_full_pipeline.ipynb`:
+
+  - Imports ``list_clip_keys``, ``load_clip_batch_from_shards``,
+    ``read_videomae_constants``, ``DEFAULT_T``, ``IMAGE_SIZE``,
+    ``NUM_CHANNELS`` from the top-level ``pipeline_a`` surface.
+  - Reuses the ``shards`` list the round-trip cell produced.
+  - Collects up to four windows, builds a batch, and asserts:
+    - shape ``(B, T, 3, 224, 224)`` with ``B = len(sample_keys)``,
+    - dtype ``float32``,
+    - min < 0 and max > 1 (normalised, not raw ``[0, 1]``),
+    - per-window identity: ``clip_key``, bare ``clip_id``, label,
+      track_id.
+  - Computes and prints per-channel means of ``clips[0].frames[0]``
+    for visual sanity (the brief's "displays one frame" hook
+    without requiring matplotlib on Colab — which the smoke check
+    does not depend on).
+  - Loads ``VideoMAEImageProcessor.from_pretrained(VIDEOMAE_PROCESSOR_MODEL_ID)``
+    and confirms the local ``IMAGENET_MEAN`` / ``IMAGENET_STD``
+    constants match the processor. The check is wrapped in a
+    ``try`` / ``except`` so an unloaded HF cache does not crash the
+    smoke check.
+
+Renumbered the existing `## 12. Done` heading to `## 13. Done`
+and added a "Pipeline A smoke check (Issue 005 Step 1)" bullet
+that points the reviewer at the cell above.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 561 tests in 13.0s — OK    # 553 prior + 8 new regression tests
+                                # (MultiWindowShardTests × 6 +
+                                #  PrefixCollisionGuardTests × 2)
+
+$ python scripts/inject_pipeline_a_smoke.py     # idempotent
+Pipeline A smoke check already present; nothing to do.
+
+$ python scripts/verify_notebook.py colab/000_full_pipeline.ipynb
+Notebook        : colab\000_full_pipeline.ipynb
+Local imports   : OK (0 error(s))
+Pyflakes        : warnings (2 cell(s) with real pyflakes issues)
+Status          : OK — notebook is ready for Colab
+```
+
+`Status: OK` means the static import audit (which is the load-bearing
+gate) is clean; the pyflakes cell-2 + cell-24 warnings are the
+documented "real issue(s)" of `from google.colab import drive` on
+non-Colab hosts and the documented "cross-cell undefined name"
+on `shards` (cell 24 references cell 22's variable, which the
+verifier classifies as expected).
+
+---
+
 ## File layout (after Issue 002)
 
 ```

@@ -1,9 +1,31 @@
 """Pipeline A — VideoMAE-ready crop-shard loader (Issue 005 Step 1).
 
 Reads Issue 003 WebDataset-style ``.tar`` crop shards and assembles
-each clip/window into a VideoMAE-ready ``(T, 3, H, W)`` float32
-tensor, plus the provenance and missing-frame mask the trainer
-needs.
+each **per-window** training example into a VideoMAE-ready
+``(T, 3, H, W)`` float32 tensor, plus the provenance and
+missing-frame mask the trainer needs.
+
+Per-window key contract
+-----------------------
+
+``clip_key`` in this module is the **per-window member stem**
+written by Issue 003, format ``<source_id>_t<track_id>_w<index>``
+(e.g. ``"X_t7_w000"``). Two windows from the same source clip —
+say ``"X_t7_w000"`` and ``"X_t7_w001"`` — share the same bare
+``metadata["clip_id"]`` (= ``"X"``) but have **different** tar
+member stems. The loader groups frames by the per-window stem
+(prefix match using ``safe_member_name(clip_key) + "_"``); the
+bare source ``clip_id`` is preserved as ``LoadedClip.clip_id``
+for downstream manifest / role joins but is never the grouping
+key.
+
+This was the post-Step-1 bug: grouping on bare ``clip_id``
+silently merged windows from the same source clip, violating
+``T = len(frames)`` for each window. The fix pins the grouping
+key on the same per-window member stem the trainer sees, and a
+trailing-underscore prefix guard rejects windows whose names
+share a stem prefix (e.g. ``X_t7_w000`` vs ``X_t70_w000``).
+
 
 This module is **data-prep only**:
 
@@ -84,7 +106,7 @@ from typing import Iterable, Sequence
 import numpy as np
 from PIL import Image
 
-from cropping.shard_writer import ShardReadResult, read_shard
+from cropping.shard_writer import ShardReadResult, read_shard, safe_member_name
 from data.manifests import FallLabel
 
 
@@ -194,19 +216,51 @@ class MissingFrameOffsetError(ValueError):
 
 @dataclass(frozen=True)
 class LoadedClip:
-    """One clip / window's decoded VideoMAE-ready tensor + provenance.
+    """One training example's decoded VideoMAE-ready tensor + provenance.
 
-    The float32 VideoMAE-ready tensor lives in ``tensor``. The
-    uint8 RGB frame array is also kept (in ``frames``) so
-    debugging / plotting paths avoid a JPEG re-decode.
+    A "training example" is one Issue 003 ``TrackWindow`` — a
+    fixed-length slice of one tracked identity's bounding-box
+    timeline. Issue 003 stores each window as a separate
+    ``<source>_t<track_id>_w<idx:03d>`` member stem inside a
+    shard. The training unit is therefore the **per-window
+    member stem**, not the bare source clip id — a single
+    source clip can have many windows, and grouping by the
+    bare id would silently merge them.
 
-    Both ``frames`` and ``tensor`` have length ``T`` and reflect
-    the **frame_offset sort order**: ``frames[i]`` / ``tensor[i]``
-    corresponds to ``frame_offsets[i]`` (and to ``frame_indices[i]``,
-    the absolute source timeline index).
+    Fields:
+
+    - ``clip_key``: the per-window member stem used to load this
+      example (e.g. ``"X_t7_w000"``). The trainer's identifier
+      for the example.
+    - ``clip_id``: the bare source clip id from the metadata
+      (``"X"``). Carried forward for manifest / role join —
+      the trainer may need to know "this example came from
+      source clip X".
+    - ``dataset``, ``label``, ``track_id``, ``source_path``:
+      preserved provenance from the metadata. ``label`` and
+      ``track_id`` are the projector heads' targets.
+    - ``frames``: ``(T, H, W, 3) uint8`` raw RGB frames. Kept so
+      debug / plotting paths don't pay a JPEG re-decode.
+    - ``tensor``: ``(T, 3, H, W) float32`` normalised —
+      the VideoMAE-ready contract.
+    - ``missing_mask``: ``(T,) bool`` — ``True`` at slots whose
+      source frame was missing (carry-forward geometry).
+    - ``coverage``, ``missing_frame_count``: provenance roll-up.
+    - ``frame_indices``: absolute frame indices in the original
+      timeline.
+    - ``frame_offsets``: ``0..T-1``; ``frames[i]`` /
+      ``tensor[i]`` corresponds to ``frame_offsets[i]``.
+    - ``shard_filename``: provenance to where the example
+      came from on disk.
+
+    Both ``frames`` and ``tensor`` reflect the **frame_offset
+    sort order**: ``frames[i]`` / ``tensor[i]`` corresponds to
+    ``frame_offsets[i]`` (and to ``frame_indices[i]``, the
+    absolute source timeline index).
     """
 
-    clip_id: str
+    clip_key: str           # per-window member stem (training example id)
+    clip_id: str           # bare source clip id from metadata
     dataset: str
     label: str
     track_id: int
@@ -367,20 +421,45 @@ def _build_provenance_strict(
     return canonical
 
 
-def _collect_frames_for_clip(
+def _collect_frames_for_window(
     shard_result: ShardReadResult,
-    clip_id: str,
+    window_key: str,
 ) -> list[tuple[int, dict[str, object], bytes]]:
-    """Pull every (frame_offset, metadata, image_bytes) row for one clip id.
+    """Pull every (frame_offset, metadata, image_bytes) row for one window.
 
-    Sort order is **numeric frame_offset** (not filename) per the
-    Issue 005 Step 1 contract, so a hypothetical non-zero-padded
-    member name still lands frames in the right slot.
+    Group frames by **tar member-name prefix** using the same
+    membership rule as
+    :meth:`cropping.shard_writer.ShardReadResult.clip_frames`:
+
+    - Member ``name`` must start with
+      ``safe_member_name(window_key) + "_"``.
+    - The trailing underscore is the separator: windows whose
+      names share a prefix but differ in trailing characters
+      (e.g. ``X_t7_w000`` vs ``X_t70_w000``) must not bleed
+      across each other.
+
+    Sort order is **numeric frame_offset** (not filename) per
+    the Issue 005 Step 1 contract, so a hypothetical
+    non-zero-padded member name still lands frames in the
+    right slot.
+
+    Note that ``metadata["clip_id"]`` (the bare source) is
+    deliberately **not** the grouping key. Two windows from
+    the same source share that bare id; grouping on it would
+    silently merge windows and invalidate the per-window
+    canonical ``T``-frame contract.
     """
+    safe = safe_member_name(window_key)
+    prefix = safe + "_"
+
     rows: list[tuple[int, dict[str, object], bytes]] = []
     for member_name, image_bytes in shard_result.image_members.items():
+        if not member_name.startswith(prefix):
+            continue
         # ``<safe>_<offset>.image.jpg`` — strip both halves to
-        # recover the original clip id, then filter by clip_id.
+        # recover the metadata sidecar name.
+        if not member_name.endswith(".image.jpg"):
+            continue
         meta_member = member_name.removesuffix(".image.jpg") + ".meta.json"
         metadata = shard_result.metadata_members.get(meta_member)
         if metadata is None:
@@ -388,9 +467,6 @@ def _collect_frames_for_clip(
                 f"Image member {member_name!r} has no matching .meta.json "
                 f"sidecar in the shard."
             )
-        metadata_clip_id = metadata.get("clip_id")
-        if metadata_clip_id != clip_id:
-            continue
         try:
             frame_offset = int(metadata["frame_offset"])
         except (KeyError, TypeError, ValueError) as exc:
@@ -485,39 +561,56 @@ def load_clip_tensor_from_shards(
     clip_key: str,
     T: int = DEFAULT_T,
 ) -> LoadedClip:
-    """Load one clip from one or more Issue 003 crop shards.
+    """Load one Issue 003 training window from one or more crop shards.
 
-    Group frames by ``clip_id`` across all shards supplied (a
-    single clip's frames may straddle a shard boundary), validate
-    required metadata + frame-offset contiguity + provenance
-    consistency across frames, decode JPEGs, build the
-    VideoMAE-ready ``(T, 3, H, W)`` float32 tensor.
+    ``clip_key`` is the **per-window member stem** issued by
+    Issue 003's runner — the format is
+    ``<source>_t<track_id>_w<idx>`` (e.g. ``"X_t7_w000"``).
+    It identifies a single fixed-length ``TrackWindow`` produced
+    from one source-clip track. Two windows from the same source
+    clip share ``metadata["clip_id"]``; the loader does NOT
+    group on that bare id (see module-level docstring).
+
+    Group frames by **tar member-name prefix** so the loader
+    never bleeds frames across windows even when they share a
+    source clip. Frames are sorted by numeric ``frame_offset``
+    after collection; offsets must equal ``range(0, T)``
+    exactly (Issue 005 Step 1 disallows pad / truncate).
 
     Args:
         shard_paths: One or more paths to ``.tar`` shard files.
-            All paths that should carry the clip's frames must be
-            supplied; the loader does not search a directory tree.
-        clip_key: The string ``clip_id`` to load.
-        T: Number of frames per clip. Must be in :data:`ALLOWED_T`
-            (16 or 32). Defaults to :data:`DEFAULT_T` (16). Matches the
-            PRD starter. The loader raises if the clip's frame
-            count differs from T — pad / truncate is disallowed.
+            All paths that should carry the window's frames must
+            be supplied; the loader does not search a directory
+            tree.
+        clip_key: The per-window member stem (e.g. ``"X_t7_w000"``).
+            ``list_clip_keys()`` enumerates the per-window stems
+            available in a shard.
+        T: Number of frames per window. Must be in :data:`ALLOWED_T`
+            (16 or 32). Defaults to :data:`DEFAULT_T` (16). Matches
+            the PRD starter. The loader raises if the window's
+            frame count differs from T — pad / truncate is
+            disallowed.
 
     Returns:
-        A :class:`LoadedClip` carrying the float32 VideoMAE tensor
-        and the preserved provenance fields.
+        A :class:`LoadedClip` carrying the float32 VideoMAE tensor,
+        the raw uint8 RGB frames, both ``clip_key`` (the per-window
+        member stem) and ``clip_id`` (the bare source clip id
+        from metadata), and the rest of the preserved
+        provenance fields.
 
     Raises:
         CropShardsMissingError: when any provided shard path does
             not exist. The error message points at Issue 003.
+        LookupError: when ``clip_key`` is not found in any of the
+            supplied shards.
         InvalidClipLengthError: when ``T`` is not in
-            :data:`ALLOWED_T`, or when the clip's frame count after
-            sorting differs from ``T``.
+            :data:`ALLOWED_T`, or when the window's frame count
+            after sorting differs from ``T``.
         MissingMetadataFieldError: when a ``.meta.json`` sidecar
             is missing or any required field is absent.
-        DuplicateFrameOffsetError: when two frames in the clip
+        DuplicateFrameOffsetError: when two frames in the window
             share the same ``frame_offset``.
-        MissingFrameOffsetError: when the clip's ``frame_offset``s
+        MissingFrameOffsetError: when the window's ``frame_offset``s
             are not contiguous 0..T-1.
         InconsistentClipProvenanceError: when frames disagree on
             provenance fields.
@@ -527,24 +620,27 @@ def load_clip_tensor_from_shards(
     paths = [Path(p) for p in shard_paths]
     _check_shards_exist(paths)
 
-    # Collect frames for this clip across all shards. A clip's
+    # Collect frames for this window across all shards. A window's
     # frames may legitimately straddle two shards (the writer does
     # not guarantee shard-internal-only placement), so we scan
-    # every shard and merge.
+    # every shard and merge. The grouping key is the per-window
+    # member-name stem (NOT the bare metadata clip_id) — see the
+    # module docstring for the multi-window rationale.
     rows: list[tuple[int, dict[str, object], bytes]] = []
     shards_used: list[str] = []
     for path in paths:
         result = read_shard(path)
-        collected = _collect_frames_for_clip(result, clip_key)
+        collected = _collect_frames_for_window(result, clip_key)
         if collected:
             shards_used.append(path.name)
         rows.extend(collected)
 
     if not rows:
         raise LookupError(
-            f"Clip {clip_key!r} not found in any of the supplied shards. "
-            f"Searched: {[str(p) for p in paths]}. Verify the clip_id is "
-            "correct (case-sensitive) and that the shards contain this clip."
+            f"Window {clip_key!r} not found in any of the supplied shards. "
+            f"Searched: {[str(p) for p in paths]}. Verify the per-window "
+            "member stem is correct (case-sensitive) and that the shards "
+            "contain this window. Use list_clip_keys() to enumerate."
         )
 
     # Sort by numeric frame_offset.
@@ -556,7 +652,7 @@ def load_clip_tensor_from_shards(
     for offset, _metadata, _bytes in rows:
         if offset in seen_offsets:
             raise DuplicateFrameOffsetError(
-                f"Clip {clip_key!r} has duplicate frame_offset {offset}."
+                f"Window {clip_key!r} has duplicate frame_offset {offset}."
             )
         seen_offsets.add(offset)
 
@@ -586,6 +682,7 @@ def load_clip_tensor_from_shards(
     shard_filename = ",".join(sorted(set(shards_used)))
 
     return LoadedClip(
+        clip_key=clip_key,
         clip_id=str(canonical["clip_id"]),
         dataset=str(canonical["dataset"]),
         label=canonical_label,
@@ -613,23 +710,28 @@ def load_clip_batch_from_shards(
     clip_keys: Sequence[str],
     T: int = DEFAULT_T,
 ) -> tuple[np.ndarray, list[LoadedClip]]:
-    """Load a batch of clips as ``(B, T, 3, H, W)`` float32 + per-clip provenance.
+    """Load a batch of training windows as ``(B, T, 3, H, W)`` float32 + per-window provenance.
 
-    The returned array is the stack of :attr:`LoadedClip.tensor`
-    across each clip in ``clip_keys`` (in that order).
+    Each entry of ``clip_keys`` is the **per-window member stem**
+    returned by :func:`list_clip_keys` — the loader does NOT
+    group windows together even when they share a bare source
+    clip id. The returned array is the stack of
+    :attr:`LoadedClip.tensor` across each window in ``clip_keys``
+    (in that order).
 
     Args:
         shard_paths: One or more shard paths to scan. All shards
-            that should carry any of the requested clips must be
+            that should carry any of the requested windows must be
             supplied.
-        clip_keys: Per-clip ``clip_id`` strings to load.
-        T: Frames per clip (default 16). Same rules as
+        clip_keys: Per-window member stems (e.g. ``["X_t7_w000",
+            "X_t7_w001"]``). Empty → :class:`ValueError`.
+        T: Frames per window (default 16). Same rules as
             :func:`load_clip_tensor_from_shards`.
 
     Returns:
         ``(batch_tensor, clips)`` where ``batch_tensor`` has
         shape ``(B, T, 3, H, W)`` float32 and ``clips`` carries
-        per-clip provenance.
+        per-window provenance.
 
     Raises:
         ValueError: when ``clip_keys`` is empty.
