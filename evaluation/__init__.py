@@ -1,9 +1,9 @@
-"""Evaluation harness public surface for Step 1 (Issue 004).
+"""Evaluation harness public surface for Step 1 + Step 2 (Issue 004).
 
 Re-exports contracts, the NotAvailable marker, the execution-context
-frozen-tier guard, and the result-persistence stub so notebooks and
-pipeline code can ``from evaluation import ...`` without reaching
-into submodules.
+frozen-tier guard, the result-persistence stub, and the clip-level
+classification metrics bundle so notebooks and pipeline code can
+``from evaluation import ...`` without reaching into submodules.
 
 Step 1 establishes:
 
@@ -18,8 +18,12 @@ Step 1 establishes:
 - A versioned, reloadable result-persistence stub rooted at the active
   layout's ``metrics/`` artifact directory.
 
-Full classification metrics, event metrics, and the slice aggregator
-land in Step 2+ and are explicitly out of scope here.
+Step 2 adds:
+
+- A clip-level classification metric bundle (accuracy, precision,
+  recall, specificity, F1, AUC-ROC, AUPRC, confusion matrix)
+  reported overall and per slice; sklearn-backed; configurable
+  operating threshold; honest ``NotAvailable`` semantics.
 """
 
 from evaluation.contracts import (
@@ -56,6 +60,14 @@ from evaluation.result_persistence import (
     encode_value,
     make_default_metadata,
 )
+from evaluation.metrics.classification import (
+    DEFAULT_SLICE_TAGS,
+    DEFAULT_THRESHOLD,
+    ConfusionMatrix,
+    SliceMetricReport,
+    SupportCounts,
+    compute_classification_metrics,
+)
 
 __all__: tuple[str, ...] = (
     # contracts
@@ -88,4 +100,12 @@ __all__: tuple[str, ...] = (
     "MetricResultStore",
     "encode_value",
     "make_default_metadata",
+    # classification metrics (Step 2)
+    "DEFAULT_THRESHOLD",
+    "DEFAULT_SLICE_TAGS",
+    "ConfusionMatrix",
+    "SupportCounts",
+    "SliceMetricReport",
+    "compute_classification_metrics",
 )
+

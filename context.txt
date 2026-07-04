@@ -19,9 +19,11 @@ generator in place + Issue 004 Step 1 (eval harness foundation) in place.
 - Issue 003: deterministic crop clip generator consuming Issue 002
   tracking artefacts, producing WebDataset-style .tar shards of
   fixed-length person crops on Drive.
-- Issue 004: eval-harness foundation (Step 1) — data contracts,
+- Issue 004: eval-harness foundation (Step 1) + classification
+  metrics + slice-based reporting (Step 2) — data contracts,
   `NotAvailable` marker, frozen-tier read guard, versioned result
-  persistence. No metric implementations yet (Step 2+).
+  persistence, sklearn-backed clip-level classification metrics.
+  Event metrics still pending (Step 3+).
 
 Blockers for downstream issues:
 - Issue 005 (Pipeline A data prep) and Issue 008 (Pipeline B data prep)
@@ -390,6 +392,279 @@ The `EVALUATION` cases changed from "may read" to "denied" — the
 test names flag the inversion (`test_evaluation_now_raises_...`,
 `test_evaluation_context_excludes_...`) so a future reader sees
 this was a deliberate policy tightening, not a regression.
+
+---
+
+## Issue 004 Step 2 — classification metrics + slice-based reporting
+
+Step 2 builds the clip-level classification metric bundle on top of
+the Step 1 contracts. Step 1 provided the data shapes, the
+`NotAvailable` marker, the frozen-tier guard, and the persistence
+stub. Step 2 adds the actual metric computation.
+
+### Files created
+
+| Path | Purpose |
+|---|---|
+| `evaluation/metrics/__init__.py` | Public surface for the metrics bundle (Step 2 forward-looking; more submodules land in later steps). |
+| `evaluation/metrics/classification.py` | sklearn-backed clip-level metric computation: accuracy, precision, recall, specificity, F1, AUC-ROC, AUPRC, confusion matrix, reported overall + per-slice. |
+| `tests/test_eval_classification.py` | 35 unit tests covering hand-computed values, threshold behaviour, AUC-ROC/AUPRC threshold independence, one-class `NotAvailable`, missing-slice aggregation, persistence round-trip. |
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `evaluation/__init__.py` | Re-exports the Step 2 types so `from evaluation import compute_classification_metrics, ...` works without reaching into submodules. |
+| `context.txt` | This section. |
+
+### Metric API contract
+
+```
+from evaluation import compute_classification_metrics
+
+reports: list[SliceMetricReport] = compute_classification_metrics(
+    predictions: Iterable[ClipPrediction],
+    labels: Iterable[ClipLabel],
+    *,
+    threshold: float = 0.5,
+    slice_tags: Sequence[str] = ("dataset", "lighting", "occlusion",
+                                 "multi_person", "action_confuser"),
+) -> list[SliceMetricReport]
+```
+
+The returned list starts with the aggregate
+(`report.slice_key is None`), followed by one report per emitted
+`(tag, value)` slice. Slice ordering is deterministic: by-tag
+alphabetical, then by-value alphabetical.
+
+Each :class:`SliceMetricReport` carries:
+
+- `slice_key: SliceKey | None` — `None` for the aggregate.
+- `support: SupportCounts` — typed `n_positive` / `n_negative` /
+  `total`.
+- `confusion_matrix: ConfusionMatrix` — typed `tn` / `fp` / `fn` /
+  `tp` (sklearn convention with `labels=[0, 1]`).
+- `metrics: tuple[MetricResult, ...]` — per-slice rows for the
+  seven primary metric names: `accuracy`, `precision`, `recall`,
+  `specificity`, `f1`, `auc_roc`, `auprc`. Each value is a real
+  `float` or `NotAvailable` with reason.
+
+`report.metric_results()` returns the flat row list for
+persistence: `metrics` rows + four `tn` / `fp` / `fn` / `tp` rows +
+three `n_positive` / `n_negative` / `total` rows. The
+:class:`MetricResultStore` accepts this list unchanged.
+
+### Threshold behaviour
+
+- **Default 0.5** (`DEFAULT_THRESHOLD`). Count-based metrics
+  (accuracy, precision, recall, specificity, F1) use
+  `score >= threshold` as the predicted "fall" hard label.
+- **AUC-ROC and AUPRC ignore the threshold.** They use the raw
+  score distribution and are threshold-independent by
+  construction. Two runs with the same data but different
+  thresholds must produce identical AUC-ROC / AUPRC values
+  (`test_auc_roc_uses_raw_scores_threshold_independent`,
+  `test_auprc_uses_raw_scores_threshold_independent`).
+
+### NotAvailable behaviour (honest, never fabricated)
+
+| Condition | Result |
+|---|---|
+| Empty `predictions` AND empty `labels` (no pairs) | empty list returned; no spurious aggregate. |
+| Per-slice eval with 0 pairs in the slice | every metric `NotAvailable(reason="empty slice")`; typed `support` and `confusion_matrix` still emitted as zero-valued. |
+| AUC-ROC on a slice with only one class | `NotAvailable(reason="only one class present in slice", metric_name="auc_roc")`. Detected explicitly via `len(unique_classes) < 2` rather than relying on sklearn's exception (sklearn's behaviour has drifted across versions — newer releases emit warnings + return `0.0` instead of raising). |
+| AUPRC on a slice with only one class | `NotAvailable(reason="only one class present in slice", metric_name="auprc")`. |
+| Precision on a slice where the model never predicts positive (`tp + fp == 0`) | `NotAvailable(reason="no predicted positives in slice", metric_name="precision")` — the denominator is literally undefined. Fixed in the Step 2 cleanup. |
+| Recall on a slice with no actual positives (`tp + fn == 0`) | `NotAvailable(reason="no actual positives in slice", metric_name="recall")`. Fixed in the Step 2 cleanup. |
+| Specificity on a slice with `n_negative = 0` | `NotAvailable(reason="no negatives in slice")` — fabricating 1.0 here would silently claim "no false positives" without any negatives to test against. |
+| F1 on a slice where precision OR recall is undefined | `NotAvailable(reason="precision or recall undefined", metric_name="f1")`. Fixed in the Step 2 cleanup. |
+| Count-based metrics on a one-class slice (e.g. accuracy when only `FALL` clips are present) | numeric, computed from sklearn as normal — the metric IS defined when the denominator is non-zero. |
+
+Sklearn parity is asserted explicitly — `test_auc_roc_matches_sklearn_directly` and `test_auprc_matches_sklearn_directly` compute the same numbers with `sklearn.metrics.roc_auc_score` / `sklearn.metrics.average_precision_score` and compare to within 12 places. No hand-rolled TP/FP/TN/FN math drives any output.
+
+### Pairing + failure modes
+
+`compute_classification_metrics` pairs predictions to labels by `clip_id`. The contract enforces one-prediction-per-clip and one-label-per-clip on BOTH sides:
+
+- Duplicate clip_id in predictions → `ValueError`.
+- Duplicate clip_id in labels → `ValueError`.
+- Prediction with no matching label → `ValueError`.
+- Label with no matching prediction → `ValueError`.
+
+Empty input (`predictions=[]` and `labels=[]`) returns an empty list — the caller genuinely has no data, so no aggregate / slice is fabricated.
+
+### Slice semantics
+
+| Input | Behaviour |
+|---|---|
+| Clip with `slice_tags=None` or `SliceTags(lighting=None, ...)` | appears in the aggregate only; contributes to no per-tag slice. |
+| Clip with `lighting="daylight"` but no `action_confuser` value | appears in `lighting=daylight` slice AND in the aggregate; does not appear in any `action_confuser=...` slice. |
+| Per-tag defaults | `("dataset", "lighting", "occlusion", "multi_person", "action_confuser")` — the PRD-mandated axes. Configurable per call. |
+| `multi_person` rendering | the manifest field is a `bool`; `SliceTags.keys()` renders it as `"true"` / `"false"` strings for stable JSON round-trip and per-slice grouping. |
+
+Per-slice support counts are correct by construction: a clip with `lighting="daylight"` enters exactly one `lighting=...` slice, no more. Multiple clip totals across slices do NOT sum to the aggregate because a single clip can enter multiple slices (one per tag it has values for).
+
+### Recall / AUPRC priority metrics
+
+Per PRD user story 38 ("false negatives treated as the most costly error") and user story 22 (AUPRC + recall must be honest), `recall` and `auprc` are emitted alongside the other count metrics — not aggregated or hidden. Their threshold behaviour and per-slice parity is the same as the count metrics they pair with.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 411 tests in 6.2s — OK    # 406 prior + 5 new for the metric-honesty cleanup
+```
+
+Coverage cross-reference vs. the spec's required test cases:
+
+| Required case | Test |
+|---|---|
+| Hand-computed TP/FP/TN/FN match the emitted confusion matrix | `test_aggregate_confusion_matrix_matches_hand_computed_tp_fp_tn_fn`, `test_lighting_daylight_slice_handles_3_clips` |
+| Hand-computed accuracy/precision/recall/specificity/F1 match sklearn-backed output | `test_aggregate_metric_values_match_hand_computed`, `test_aggregate_support_counts_match_hand_computed`, `test_auc_roc_matches_sklearn_directly`, `test_auprc_matches_sklearn_directly` |
+| Threshold changes alter count-based metrics | `test_lower_threshold_changes_count_based_metrics`, `test_count_based_metrics_depend_on_threshold`, `test_default_threshold_constant_is_one_half` |
+| AUC-ROC/AUPRC use raw scores and are threshold-independent | `test_auc_roc_uses_raw_scores_threshold_independent`, `test_auprc_uses_raw_scores_threshold_independent` |
+| One-class slices return NotAvailable for AUC-ROC/AUPRC | `test_one_class_slice_returns_not_available_for_auc_roc`, `test_one_class_slice_returns_not_available_for_auprc`, `test_count_based_metrics_are_numeric_even_for_one_class_slice`, `test_all_no_fall_no_predicted_positives_is_fully_undefined`, `test_all_fall_slice_is_numeric_for_recall_only` |
+| Missing slice metadata lands in aggregate-only bucket | `test_clips_with_no_slice_tags_only_in_aggregate`, `test_clip_with_partial_slice_tags_is_aggregate_also`, `test_default_slice_tags_constant` |
+| Per-slice support counts are correct | `test_aggregate_support_counts_match_hand_computed`, `test_per_slice_support_sums_to_total`, `test_lighting_daylight_slice_handles_3_clips`, `test_metric_results_includes_support_and_confusion_rows` |
+| Persisted metric payload remains structured and reloadable | `test_full_report_persists_and_reloads`, `test_persisted_payload_carries_support_and_cm_per_slice` |
+| Degenerate-slice precision / recall / F1 (Step 2 cleanup) | `test_all_no_fall_no_predicted_positives_is_fully_undefined`, `test_all_no_fall_but_some_predicted_positives_has_numeric_precision`, `test_all_fall_with_no_predicted_positives_is_fully_undefined`, `test_all_fall_slice_is_numeric_for_recall_only`, `test_action_confuser_sitting_all_no_fall_slice` |
+
+Additional container + pairing tests added for cheap coverage:
+
+- `ContainerShapeTests` (4) — `ConfusionMatrix` + `SupportCounts` reject
+  bad input at construction.
+- `PairingAndEmptyTests` (5) — duplicate-id checks on both sides,
+  empty inputs return empty list, missing-slice-tag path.
+- `AllNegativeSliceTests` (2) — slice whose labels are all
+  `NO_FALL`; degenerate precision / recall / F1 surface NotAvailable.
+- `AllPositiveSliceTests` (2) — slice whose labels are all `FALL`;
+  specificity becomes NotAvailable; recall is numeric.
+- `ActionConfuserSittingTests` (1) — a PRD-flavoured slice
+  (`action_confuser=sitting`, all `no_fall`) proving recall / F1 are
+  NotAvailable, specificity is numeric, and the false-positive count
+  is visible in both the typed `confusion_matrix.fp` and the
+  persisted `fp` MetricResult row.
+
+### Known limitations / Step 3+
+
+- **No event metrics yet.** `EventPredictionStream` and
+  `EventGroundTruthWindow` are still unconsumed; event-level
+  recall, false alarms/hour, detection delay, cross-dataset F1
+  land in Step 3.
+- **No "detector-of-the-detector" self-test yet.** Shuffled-labels
+  + degraded-predictions self-tests land alongside event metrics.
+- **No slice aggregator orchestrator yet.** The classifier bundle
+  returns `list[SliceMetricReport]`; an orchestrator that owns
+  pairing, persistence, and run-summary formatting lands when
+  the metric bundle grows beyond one entry point.
+- **No Colab notebook.** A 004-Step-2 notebook wires
+  `compute_classification_metrics(...)` into a real model + DRIVE
+  result-store end-to-end run; deferred until Step 3 so the
+  notebook covers events too.
+
+---
+
+## Issue 004 Step 2 — metric-honesty cleanup
+
+Step 2's first pass on classification metrics relied on sklearn's
+`zero_division=0` knob for precision / recall / F1 — silently
+fabricating `0.0` when the denominator was undefined. The cleanup
+removes that dependency entirely; degenerate-slice metric values are
+now reported as `NotAvailable` with a precise reason rather than as
+a fake `0.0`.
+
+### What changed
+
+- `evaluation/metrics/classification.py`
+  - Module docstring adds the full degenerate-slice contract as a
+    table; same table is mirrored in `context.txt`.
+  - `compute_classification_metrics` docstring adds a
+    "Degenerate-slice semantics" bullet.
+  - The dispatch helper `_sklearn_compute` and the placeholder
+    wrapper `_emit_metric_pair` are gone. A new single source of
+    truth, `_emit_metrics_for_slice`, builds all seven primary
+    `MetricResult` rows from a single computed confusion matrix +
+    raw scores.
+  - **`_compute_one_slice_report` is deleted** (it was dead — the
+    actual entry path went through an inner `_report` function).
+  - `_compute_auc_roc` / `_compute_auprc` return annotations are
+    tightened to `float | NotAvailable` to reflect the two-shape
+    return type.
+  - `zero_division=0` is no longer passed to `precision_score`,
+    `recall_score`, or `f1_score`. We never call sklearn on a
+    undefined denominator; instead we gate the call on
+    `tp + fp > 0` / `tp + fn > 0` and surface `NotAvailable` when
+    the gate fails.
+  - `_thresholded_pairs` is hoisted out of the inner closure so
+    it can be shared by the empty / non-empty report paths; the
+    non-empty report path now delegates to
+    `_emit_metrics_for_slice`.
+  - `_empty_report` is hoisted out as a named helper to keep the
+    `_report` function readable.
+
+- `tests/test_eval_classification.py`
+  - Three new test classes (`AllNegativeSliceTests`,
+    `AllPositiveSliceTests`, `ActionConfuserSittingTests`) cover
+    the contract:
+
+        - `test_all_no_fall_no_predicted_positives_is_fully_undefined`
+          — when the model never predicts positive AND the slice
+          has no actual positives, every degenerate metric becomes
+          NotAvailable with the precise reason
+          (`"no predicted positives in slice"`,
+          `"no actual positives in slice"`, etc.).
+
+        - `test_all_no_fall_but_some_predicted_positives_has_numeric_precision`
+          — when some predictions cross the threshold, precision
+          becomes well-defined (and is `0.0` because `tp=0`),
+          but recall / F1 stay NotAvailable.
+
+        - `test_all_fall_slice_is_numeric_for_recall_only` —
+          symmetric case: recall numeric, specificity
+          NotAvailable.
+
+        - `test_all_fall_with_no_predicted_positives_is_fully_undefined`
+          — pathological case combining both degeneracies.
+
+        - `test_action_confuser_sitting_all_no_fall_slice` —
+          PRD-flavoured case: `action_confuser=sitting` with all
+          `no_fall` labels. The slice's false-positive count (1)
+          is visible in both `cm.fp` and the persisted
+          `MetricResult(name="fp")` row.
+
+### Why this is correct, not just stricter
+
+A degenerate slice has a denominator of zero. The mathematical
+value is **undefined**, not zero. Reporting `0.0` for "precision
+on a slice where the model never predicts positive" silently reads
+as "the model is wrong about every positive it predicted" — but
+there *are* no predicted positives, so the statement is vacuous.
+Falsifying `0.0` in this corner poisons any downstream selector /
+aggregator that compares against `> 0` thresholds or averages
+across heterogeneous slices; an unavailable metric must surface as
+unavailable so the aggregator can decide whether to skip the slice,
+skip the metric, or skip the model entirely.
+
+Conversely, a numeric `0.0` reading on a *defined* denominator
+(e.g. `tp=0, fp>0` so `precision = 0/1 = 0.0`) IS a real result —
+the model got every predicted positive wrong. The contract
+distinguishes those two cases precisely: `tp + fp == 0` →
+`NotAvailable`; `tp + fp > 0` → numeric (sklearn). The same rule
+applies to recall, F1, and specificity.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 411 tests in 6.2s — OK    # 406 prior + 5 new for the metric-honesty cleanup
+```
+
+Step-2 prior tests (`HandComputedMetricsTests`,
+`SliceReportingTests`, `ThresholdTests`, `CurveMetricTests`,
+`MissingSliceMetadataTests`, `PersistenceRoundTripTests`,
+`PairingAndEmptyTests`, `ContainerShapeTests`) all still pass —
+the original 35 tests were not weakened, just supplemented with
+5 new ones that target the degenerate-slice shape of the contract.
 
 ---
 
