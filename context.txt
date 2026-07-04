@@ -22,11 +22,12 @@ generator in place + Issue 004 Step 1 (eval harness foundation) in place.
 - Issue 004: eval-harness foundation (Step 1) + classification
   metrics + slice-based reporting (Step 2) + detector-of-the-
   detector self-test (Step 3) + event-level metrics + component-
-  metric scaffold (Step 4). Steps 1–4 ship the data contracts,
-  the metric bundle, the self-test, and the event-level path.
-  Pipeline C post-verification alert-feeds and component-library
-  integrations (motmetrics / TrackEval) land when the projects
-  request them.
+  metric scaffold (Step 4) + Le2i annotation parser (Step 5).
+  Steps 1–5 ship the data contracts, the metric bundle, the
+  self-test, the event-level path, and the first dataset's GT
+  adapter. Pipeline C post-verification alert-feeds and
+  component-library integrations (motmetrics / TrackEval) land
+  when the projects request them.
 
 Blockers for downstream issues:
 - Issue 005 (Pipeline A data prep) and Issue 008 (Pipeline B data prep)
@@ -1119,6 +1120,159 @@ GT [100, 130], alerts [109, 119, 129]
 - detection_delay_mean      : 9 frames
 - false_alarms_per_hour     : 0  (with fps=30, total_frames=900)
 ```
+
+---
+
+## Issue 004 Step 5 — Le2i ground-truth adapter
+
+Step 5 lands the first dataset-specific annotation parser. The
+parser is fully unit-tested against small in-memory text fixtures
+that match the verified Le2i annotation format — no Kaggle
+download, no real video file, no OpenCV dependency at test time.
+
+### Files created
+
+| Path | Purpose |
+|---|---|
+| `data/le2i.py` | Annotation parser, per-frame detection container, video/annotation pairing helpers, FPS helper. |
+| `tests/test_le2i_parser.py` | 36 unit tests: no-fall fixture, fall fixture, malformed input (raise), all-zero bbox (present=False), missing-file path (returns None), non-contiguous stems, nested same-named subfolder resolution. |
+
+### Le2i annotation contract
+
+```
+<fall_start_frame>          # line 1, integer, 1-based
+<fall_end_frame>            # line 2, integer, 1-based
+<frame_index>, <flag>, <x1>, <y1>, <x2>, <y2>   # line 3+
+...
+```
+
+- **Lines 1 + 2.** Inclusive 1-based frame indices of the fall
+  window. ``0, 0`` is the **no-fall sentinel** and produces no
+  event window. Mixed ``(0, X)`` / ``(X, 0)``, inverted
+  (start > end), and zero-indexed windows all raise
+  `ValueError` — fail loud.
+- **Line 3+.** Per-frame detection row. ``frame_index`` is
+  1-based; ``flag`` is preserved verbatim (the parser does
+  not interpret it); ``x1, y1, x2, y2`` are pixel-corner
+  coordinates.
+- **All-zero box.** ``0, 0, 0, 0`` is the absent-person marker;
+  the row is preserved with ``present=False`` (so a
+  downstream consumer can skip without losing the row's
+  presence) and never becomes a GT box.
+- **Malformed non-zero box.** ``x1 >= x2`` or ``y1 >= y2`` is
+  rejected; when ``frame_size`` is supplied, the box must also
+  fit inside the frame (`0 <= x1 < x2 <= width`, etc.).
+
+### No-fall sentinel behaviour
+
+`parse_le2i_annotation_text` parses a ``0 0`` first-two-lines
+fixture into a `Le2iAnnotation` whose `fall_window` is the
+empty tuple, `has_fall` is `False`, and `event_window()` is
+`None`. No event is created — the metric bundle treats a
+no-fall clip as "no event GT available" via `NotAvailable`,
+never as a fabricated 0/0 → 0.0 reading.
+
+### Missing-GT behaviour
+
+`parse_le2i_annotation(path)` returns `None` when the file
+does not exist; the helper does **not** raise. `collect_le2i_clips`
+records `annotation=None` on the resulting `Le2iVideoPair`,
+so the clip is preserved in the inventory but the metric
+bundle can refuse to compute event-level metrics for it. FPS
+still surfaces (with fallback if configured) so
+false-alarms-per-hour + detection-delay-in-seconds remain
+computable on the missing-GT clip without requiring GT.
+
+The brief's "Office and Lecture-room may have videos but no GT"
+case maps to this path exactly — those clips are walked, the
+absence is recorded honestly, downstream consumers can branch
+on `annotation is None`.
+
+### FPS fallback behaviour
+
+`read_le2i_fps(video_path, *, fallback_fps=None)` reads the
+FPS via OpenCV (lazy-imported so the parser is usable in
+environments where OpenCV is not yet wired). Behaviour:
+
+| OpenCV status | `fallback_fps` provided? | Returned value |
+|---|---|---|
+| Available, FPS > 0 | any | the float FPS |
+| Available, but file unreadable / FPS == 0 | yes | `fallback_fps` (float) |
+| Available, but file unreadable / FPS == 0 | no | `NotAvailable("cannot read FPS from .avi")` |
+| OpenCV import fails | yes | `fallback_fps` (float) |
+| OpenCV import fails | no | `NotAvailable("opencv-python not installed")` |
+
+The fallback is **never** silently applied to a path that
+succeeds at reading FPS — only failures route through the
+fallback. With no fallback, failures are surfaced as
+`NotAvailable` rather than fabricated as `25.0`. The metric
+bundle's fps-less paths (frames-based delays, false-alarm count)
+remain computable in either case.
+
+### Pairing helpers
+
+| Helper | Behaviour |
+|---|---|
+| `pair_video_with_annotation(video, annotations_root)` | Pair by filename stem; search order is `annotations_root / stem.txt` then `annotations_root / stem / stem.txt` (nested same-name subfolder). Returns the matched `.txt` path or `None`. |
+| `collect_le2i_clips(videos_root, *, annotations_root=None, fallback_fps=None, frame_size=None)` | Walk `videos_root` (any depth) for `.avi`/`.mp4` files, pair each with its annotation via `pair_video_with_annotation`, attach the per-pair FPS read. `annotation=None` is preserved; videos in subfolders are picked up. |
+
+Non-contiguous stems work without special-casing: the walk
+finds every `.avi` regardless of gaps in numbering, and the
+pairer only cares about the stem-to-stem match on each
+individual file.
+
+### What Step 5 explicitly does not do
+
+- No training, no model code, no metric computation. The
+  parser produces `Le2iAnnotation` / `Le2iVideoPair` records
+  and lets downstream modules (cropping, metrics) consume
+  them.
+- No real Kaggle download. Tests run on inline text fixtures.
+- No real video reads. `read_le2i_fps` is exercised only on
+  the missing-file and fallback-configured paths at test
+  time; the OpenCV-succeeds path is exercised when real
+  Le2i videos land on disk.
+- No skeleton / pose-adapter (PCK at event level stays in
+  `compute_component_metrics` as a `NotAvailable` row).
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 517 tests in 6.9s — OK    # 481 prior + 36 new for Step 5
+```
+
+Coverage cross-reference vs. the spec's required test cases:
+
+| Required case | Test |
+|---|---|
+| No-fall fixture — sentinel yields no event window, frame-1 box (204, 61, 273, 198) | `NoFallFixtureTests.test_no_fall_sentinel_yields_empty_fall_window`, `test_no_fall_event_window_adapter_returns_none`, `test_no_fall_frame_1_box_is_parsed` |
+| Fall fixture — event window [144, 164], frame-1 box (205, 70, 259, 170) | `FallFixtureTests.test_fall_window_is_parsed_inclusive`, `test_fall_event_window_adapter_returns_event`, `test_fall_frame_1_box_is_parsed` |
+| Malformed bbox with `x1 >= x2` raises | `MalformedAnnotationTests.test_x1_greater_or_equal_to_x2_raises` |
+| All-zero bbox is treated as absent person | `NoFallFixtureTests.test_no_fall_absent_person_row_is_marked_absent`, `AllZeroBboxTests.test_zero_box_is_parsed_with_present_false` |
+| Missing annotation returns GT NotAvailable without crashing | `MissingGTTests.test_parse_le2i_annotation_returns_none_for_missing_file`, `test_collect_le2i_clips_records_none_annotation_for_missing_gt` |
+| Video/annotation pairing works with non-contiguous stems | `PairingHelperTests.test_pair_with_non_contiguous_indices` |
+| Nested same-name subfolder resolution works | `PairingHelperTests.test_pair_nested_same_name_subfolder`, `CollectLe2iClipsTests.test_collect_descends_into_nested_subfolders` |
+
+Additional cheap coverage:
+
+- `MalformedAnnotationTests` (10) — `y1 >= y2`, mixed-zero
+  fall window, inverted window, zero-indexed window, too few
+  lines, malformed line column count, non-integer values,
+  out-of-bounds box (with `frame_size` set), zero-indexed
+  detection rows.
+- `ContainerShapeTests` (2) — `Le2iFrameDetection` rejects
+  `frame_index=0` and negative coordinates at construction.
+- `PairingHelperTests` (5) — direct match, nested match,
+  no match, non-contiguous indices, direct-takes-precedence
+  over subfolder.
+- `CollectLe2iClipsTests` (3) — multi-file walk + missing-GT,
+  nested subfolder descent, missing-videos-root returns
+  empty list (not crash).
+- `MissingGTTests` (6) — missing-file path, file load,
+  collector + missing GT, FPS fallback paths.
+
+---
 
 ---
 
