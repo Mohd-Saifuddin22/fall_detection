@@ -2578,6 +2578,107 @@ verifier classifies as expected).
 
 ---
 
+## Issue 005 Step 1 — Run All fast-forward on existing crop shards
+
+After Pipeline A's first end-to-end run lands shards on Drive,
+re-running `colab/000_full_pipeline.ipynb` with `Run All` should
+NOT repeat URFD staging, perception, and crop generation. The
+notebook now detects existing ``shard-*.tar`` files and skips the
+heavy work, jumping directly to shard verification + the Pipeline A
+smoke check.
+
+### Skip / reuse behaviour
+
+| Trigger | Behaviour |
+|---|---|
+| `FORCE_RECOMPUTE=False` AND at least one `shard-*.tar` exists in `CROPS_ROOT` | Reuse existing shards. Heavy upstream cells print a skip message and return. Notebook advances to verification + Pipeline A smoke check. |
+| `FORCE_RECOMPUTE=False` AND no shards exist | Full build runs (URFD staging, manifest, perception, cropping). |
+| `FORCE_RECOMPUTE=True` | Full build runs even when shards exist. |
+
+The idempotency key is real Drive artefacts — ``CROPS_ROOT.glob("shard-*.tar")`` — not a flag file. A reviewer who wants to force a rebuild sets `FORCE_RECOMPUTE=True` in the config cell.
+
+### Config variables (set in the new §1a config cell)
+
+| Variable | Default | Used by |
+|---|---|---|
+| `FORCE_RECOMPUTE` | `False` | Toggles the gating logic. |
+| `CROPS_ROOT` | `layout.artifacts / "crops"` | All gated cells + the always-run verification + Pipeline A smoke check. Always defined, regardless of skip mode. |
+| `existing_shards` | runtime | `sorted(CROPS_ROOT.glob("shard-*.tar"))`. |
+| `CROPS_ALREADY_BUILT` | `bool(existing_shards) and not FORCE_RECOMPUTE` | The gating predicate. |
+
+### Changed notebook cells
+
+| Cell index (post-edit) | Cell | Change |
+|---|---|---|
+| n/a | trailing duplicate `## 12. Done — Issue 002 + 003 closure conditions` | Deleted (a leftover from the previous Step 1 notebook wiring). |
+| 3 (markdown) | `## 1a. Pipeline A skip / reuse config` | New heading — sits between data-mode setup (§1) and dependency install (§2). |
+| 4 (code) | the config cell | New — defines `FORCE_RECOMPUTE`, `CROPS_ROOT`, `existing_shards`, `CROPS_ALREADY_BUILT`, and prints the chosen branch. |
+| 10 (code) | Kaggle credentials | Wrapped with `if not CROPS_ALREADY_BUILT: ... else: print(skip)`. |
+| 12 (code) | URFD staging | Gated. |
+| 14 (code) | Manifest build | Gated. |
+| 16 (code) | Perception run | Gated. |
+| 18 (code) | Perception summary | Gated. |
+| 20 (code) | Crop config | Gated. |
+| 22 (code) | Run cropping | Gated. |
+
+Always-run cells (no gating): Drive mount, dependency install,
+torch verification, shard verification (round-trip), Pipeline A
+loader smoke check.
+
+Skip message (printed by each gated cell when shards already exist):
+
+> Reusing existing crop shards on Drive; heavy upstream build is
+> skipped. Set FORCE_RECOMPUTE=True (in the config cell above) to
+> rebuild anyway.
+
+### Pipeline A smoke check preservation
+
+`Run All` reaches the Pipeline A smoke check either via the full
+build (fresh runs) or via the fast-forward path (existing
+artefacts). The smoke check itself reads from `CROPS_ROOT` /
+`shards`, so both paths feed it the same artefact stream. The
+smoke check does NOT train VideoMAE and does NOT compute model
+metrics — those land in later Issue 005 / Issue 009 / Issue 007+
+steps.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 561 tests in 11.8s — OK    # no regression — no test surface for this fix, no test deleted/added
+
+$ python scripts/verify_notebook.py colab/000_full_pipeline.ipynb
+Notebook        : colab\000_full_pipeline.ipynb
+Local imports   : OK (0 error(s))
+Pyflakes        : warnings (2 cell(s) with real pyflakes issues)
+Status          : OK — notebook is ready for Colab
+```
+
+`Status: OK` means the load-bearing static-import audit is clean.
+The two pyflakes warnings are the documented `from google.colab`
+non-Colab-host noise on cell 2 plus the cross-cell `shards`
+reference on cell 26, both explicitly classified as expected by
+the verifier.
+
+A live Run All on Colab, after Issue 003 has produced shards:
+
+1. §1 mounts Drive.
+2. §2 installs deps.
+3. §1a config detects the existing shards and prints
+   "Notebook will REUSE existing crop shards…".
+4. Cells §4 Kaggle → §10 cropping all print the skip message
+   and return — no Kaggle read, no YOLO run, no Kaggle
+   download.
+5. §11 verification reads the existing shards (round-trip).
+6. §12 Pipeline A smoke check loads a small batch and asserts
+   the tensor contract + normalisation parity.
+7. §13 Done.
+
+A live Run All on a fresh Drive artefacts path runs the heavy
+build end-to-end because `existing_shards` is empty.
+
+---
+
 ## File layout (after Issue 002)
 
 ```
