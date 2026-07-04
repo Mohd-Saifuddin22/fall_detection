@@ -9,7 +9,7 @@
 
 Phase I (Data Collecting & Processing) — Issue 001 foundation in place
 + Issue 002 perception front-end in place + Issue 003 crop clip
-generator in place.
+generator in place + Issue 004 Step 1 (eval harness foundation) in place.
 
 - Issue 001: Colab setup + role-locked dataset manifest (schema 1.1).
 - Issue 002: YOLO26 + ByteTrack perception front-end, fold-of-frames
@@ -19,6 +19,9 @@ generator in place.
 - Issue 003: deterministic crop clip generator consuming Issue 002
   tracking artefacts, producing WebDataset-style .tar shards of
   fixed-length person crops on Drive.
+- Issue 004: eval-harness foundation (Step 1) — data contracts,
+  `NotAvailable` marker, frozen-tier read guard, versioned result
+  persistence. No metric implementations yet (Step 2+).
 
 Blockers for downstream issues:
 - Issue 005 (Pipeline A data prep) and Issue 008 (Pipeline B data prep)
@@ -32,6 +35,365 @@ Blockers for downstream issues:
 
 Stand up the shared perception front-end that turns raw video (or a
 folder of ordered frames) into per-person tracks with stable IDs.
+
+---
+
+## Completed work — Issue 004 Step 1 (eval harness foundation)
+
+Built the foundation layer of the evaluation harness without
+implementing any metrics. Step 1 establishes the contracts, the
+frozen-tier access guard, the machine-readable "not available"
+marker for metrics that cannot be computed, and the versioned
+result-persistence stub. Full classification metrics, event
+metrics, slice aggregation, and the "detector-of-the-detector"
+self-test land in Step 2+ and are explicitly out of scope here.
+
+### Files created
+
+| Path | Purpose |
+|---|---|
+| `evaluation/__init__.py` | Re-exports the eval-harness public surface. |
+| `evaluation/contracts.py` | Data contracts: `SliceKey`, `SliceTags`, `ClipPrediction`, `ClipLabel`, `EventPredictionStream`, `EventGroundTruthWindow`, `MetricResult`. |
+| `evaluation/not_available.py` | `NotAvailable` machine-readable marker for metrics that cannot be computed (mAP, IDF1, MOTA, HOTA, false-alarms/hour, detection-delay, ...). Distinct from numeric 0.0 — carries a reason string. |
+| `evaluation/execution_context.py` | `ExecutionContext` enum + frozen-tier read guard. Reuses `ClipRole`, `ClipRole.FROZEN_UNSEEN_TEST`, and `Manifest.by_role()` from `data.manifests`. |
+| `evaluation/result_persistence.py` | `MetricResultStore` + `MetricResultPayload` + `EvalRunMetadata`. Versioned, reloadable JSON under the active layout's `metrics/` root (no hardcoded Drive paths). |
+| `tests/eval_fixtures.py` | In-memory toy fixtures (clip builders + a mixed-role manifest that exercises every role + slice-tag dimension). |
+| `tests/test_eval_contracts.py` | 40 contract shape tests. |
+| `tests/test_eval_not_available.py` | 21 shape + serialisation tests for `NotAvailable`. |
+| `tests/test_eval_frozen_guard.py` | 30 guard tests: coercion + allow-list + select / get / enforce + coexistence with `validate_manifest`. |
+| `tests/test_eval_result_persistence.py` | 37 persistence tests: encode value + round-trip + load strictness + store end-to-end + layout-root integration. |
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `context.txt` | This section. |
+
+### API contracts introduced
+
+1. **Data contracts** (`evaluation.contracts`)
+
+   - `SliceKey(tag: str, value: str)` — hashable label for one slice.
+     Validates non-empty fields. `label()` returns `"tag=value"`.
+     `to_dict` / `from_dict` for JSON round-trip.
+   - `SliceTags(lighting, occlusion, multi_person, action_confuser)` —
+     mirrors the optional manifest slice fields. `from_clip(record)`
+     builds one from a `ClipRecord`. `keys()` materialises into
+     `SliceKey`s; `multi_person=True` renders as `"true"` (string
+     for JSON safety).
+   - `ClipPrediction(clip_id, score, model_id, dataset, role, slice_tags=None)` —
+     one model's output for one clip. `score ∈ ℝ` (range not enforced).
+   - `ClipLabel(clip_id, label, dataset, role, source_path, slice_tags=None)` —
+     ground truth plus manifest metadata.
+   - `EventPredictionStream(clip_id, frame_scores, model_id, clip_start_frame=0, clip_end_frame=0)` —
+     ordered `(frame_index, score)` tuples; sparse and dense both
+     legal.
+   - `EventGroundTruthWindow(clip_id, start_frame, end_frame, label)` —
+     inclusive `[start, end]`; `start==end` is a legal single-frame
+     window; rejected if `start > end`.
+   - `MetricResult(name, value, slice_key=None, higher_is_better=True, notes=None)` —
+     value is `float | int | NotAvailable`. `is_available()` checks
+     the shape; `numeric_value()` raises if the metric is unavailable.
+
+   All contracts are `frozen=True` dataclasses (mutation blocked).
+
+2. **`NotAvailable(reason, metric_name=None)`** (`evaluation.not_available`)
+
+   - Distinct from numeric 0.0 — a missed metric is not the same
+     signal as `the metric read 0.0`.
+   - Always falsy (`bool(NotAvailable(...)) is False`) so a guard
+     clause `if not metric.value: ...` correctly treats it as
+     "skip this metric".
+   - Carries a non-empty reason string; carries an optional
+     `metric_name` for self-describing aggregation.
+   - JSON shape: `{"__not_available__": True, "reason": "...", "metric_name"?: "..."}`.
+   - `from_dict` / `is_not_available_marker` / `to_dict` for round-trip.
+   - Re-exported as `NOT_AVAILABLE_JSON_KEY = "__not_available__"` so a
+     third-party consumer can recognise the marker shape without
+     importing the type.
+
+3. **`ExecutionContext` enum + frozen-tier read guard**
+   (`evaluation.execution_context`)
+
+   - `ExecutionContext` values: `TRAINING` / `TUNING` / `EVALUATION` /
+     `FINAL_JUDGEMENT` / `UNKNOWN`.
+   - `FROZEN_ALLOWED_CONTEXTS = {EVALUATION, FINAL_JUDGEMENT}`.
+     Training / tuning / unknown **never** receive
+     `ClipRole.FROZEN_UNSEEN_TEST` records.
+   - `coerce_execution_context(value)` — tolerant of `None`, strings
+     (case-insensitive), other enum values, and arbitrary objects;
+     unknown values become `UNKNOWN` (fail closed — a default-`None`
+     kwarg never grants privileged access).
+   - `select_clips_for_context(manifest, context)` — returns the
+     manifest minus frozen for non-allowed contexts, full manifest
+     for allowed contexts. Always returns a fresh list.
+   - `get_frozen_clips(manifest, context)` — explicit frozen accessor
+     that **raises `FrozenAccessError`** for non-allowed contexts so a
+     training loop that accidentally calls a frozen-aware function
+     fails loud instead of silently receiving the non-frozen subset.
+   - `enforce_no_frozen_in_iterable(clips, context)` — boundary check
+     for hand-built clip lists that bypass `select_clips_for_context`.
+   - `frozen_clips_present(manifest)` — diagnostic helper for
+     callers that want to assert vault presence before requesting.
+
+   Reuses (does not duplicate) `ClipRole`, `ClipRole.FROZEN_UNSEEN_TEST`,
+   `Manifest.by_role()`, and the existing `validate_manifest` vault
+   isolation rule.
+
+4. **Result-persistence stub** (`evaluation.result_persistence`)
+
+   - `RESULT_PAYLOAD_FORMAT_VERSION = "1.0"`. Bump this when the
+     persisted schema changes in a way that's not transparently
+     loadable by older code.
+   - `EvalRunMetadata(run_id, model_id, created_at, context, notes=None)`
+     — provenance for one run. `make_default_metadata()` stamps the
+     current UTC ISO-8601 timestamp.
+   - `MetricResultPayload(format_version, metadata, metrics)` —
+     `to_dict` / `from_dict` for round-trip; `from_dict` is strict on
+     shape and `format_version` so a schema bump fails loud instead
+     of silently losing fields.
+   - `MetricResultStore(metrics_root: Path | str)` — writes
+     `<root>/<run_id>/results.json` + `<root>/<run_id>/summary.txt`.
+     `run_id` is validated against path separators so it cannot
+     escape its directory.
+   - `encode_value(value, metric_name=None)` — JSON-friendly
+     renderer for a single metric value: numeric passes through as
+     `float`; `NotAvailable` renders as the marker dict, with the
+     `metric_name` kwarg stamping the marker when it's not already
+     set (so a payload consumer that lost the surrounding record
+     ordering can still pair marker → metric name).
+   - The store accepts a plain `Path` or string — never a hardcoded
+     Drive path. The integration test confirms it works against a
+     `DataLayout.metrics`-style root (`<root>/metrics`).
+
+### Decisions made
+
+- **`NotAvailable` is a dataclass, not `None` or `NaN`.** A bare
+  `None` is too generic; `float("nan")` is hard to grep for and
+  silently aggregates wrong. A dedicated type makes the semantics
+  explicit at the value layer.
+- **The frozen guard fails closed by default.** `UNKNOWN` is
+  treated as a non-allowed context, and `coerce_execution_context`
+  maps any non-enum / non-string value to `UNKNOWN`. Adding a new
+  privileged context is a one-line change in
+  `FROZEN_ALLOWED_CONTEXTS` and should be deliberate.
+- **`get_frozen_clips` raises, `select_clips_for_context` filters.**
+  Two entry points on purpose: the filter is for callers who want
+  "whatever's appropriate for this context"; the raise is for
+  callers who specifically asked for frozen and would notice if
+  they accidentally got an empty list. Code that wants a frozen-
+  tier "yes I really meant it" assertion uses the raise variant.
+- **The guard reuses, does not replace, the validator.** The
+  existing `_check_frozen_vault_isolation` rule catches manifests
+  where a vault dataset leaked into train/validate. The guard is a
+  second layer against accidental context misuse at READ time.
+  Step 1 tests prove both layers coexist without one shadowing the
+  other.
+- **Result persistence is format-versioned at the payload root.**
+  Schema bumps can be detected immediately on load; the loader
+  refuses unknown `format_version` rather than guessing.
+- **`run_id` is a filename segment, not a path.** Path separators
+  are rejected in `MetricResultStore.save()` so a `run_id` cannot
+  escape its directory.
+- **Stub, not implementation.** Step 1 deliberately ships only the
+  container. No classifier produces metric results yet, so there is
+  no `evaluation.metrics.classification` or `evaluation.metrics.event`
+  module. Step 2+ adds those.
+
+### Assumptions
+
+- **Step 1 ships with no real trained models.** Therefore no
+  classification metrics are implemented, no aggregate / sliced
+  numbers are produced, and the persistence stub is exercised
+  with hand-built fixtures only.
+- **The active layout concept from Issue 002 carry-over still
+  applies.** `MetricResultStore` accepts a path; callers are
+  responsible for passing `layout.metrics` (or equivalent). No
+  Drive paths are baked into the eval layer.
+- **`Manifest.by_role()` is stable.** The guard depends on it
+  returning an iterable of `ClipRecord` rows, ordered as the
+  manifest has them. If the loader is extended (e.g. to add an
+  indexing data structure), the guard should be revisited.
+- **`NotAvailable` is intentional silence, not an error.** Callers
+  that want a hard error when a metric is missing should check
+  `result.is_available()` and raise; the eval harness itself does
+  not raise on `NotAvailable`.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 364 tests in 4.5s — OK    # 236 prior + 128 new for Step 1
+                               # (40 contracts + 21 NotAvailable
+                               #  + 30 frozen guard
+                               #  + 37 result persistence)
+```
+
+New test coverage breakdown (per the task's required cases):
+
+| Required case | Test |
+|---|---|
+| Training context cannot read frozen records | `test_training_context_excludes_frozen_clips`, `test_training_raises_frozen_access_error` |
+| Tuning context cannot read frozen records | `test_tuning_context_excludes_frozen_clips`, `test_tuning_raises_frozen_access_error` |
+| Final-evaluation context can read frozen records | `test_evaluation_context_includes_frozen_clips`, `test_final_judgement_context_includes_frozen_clips`, `test_evaluation_can_read_frozen`, `test_final_judgement_can_read_frozen` |
+| Unknown / missing context is denied | `test_unknown_context_denies_frozen_access`, `test_none_context_denies_frozen_access`, `test_unknown_string_context_denies_frozen_access`, `test_unknown_raises_frozen_access_error`, `test_none_raises_frozen_access_error` |
+| `NotAvailable` serialises clearly and is not confused with 0.0 | `test_not_equal_to_zero_point_zero`, `test_json_dumps_keeps_marker_distinct_from_0`, `test_metric_value_zero_is_kept_distinct_from_not_available`, `test_is_not_available_marker_*` |
+| Metric-result persistence writes a structured, reloadable JSON payload | `test_save_writes_reloadable_json`, `test_payload_round_trips_through_json`, `test_not_available_round_trips_losslessly`, `test_slice_key_round_trips`, `test_round_trip_works_against_layout_style_root` |
+
+### Open issues (Step 2+)
+
+- **No classification metrics yet.** Accuracy, precision, recall,
+  specificity, F1, AUC-ROC, AUPRC, confusion matrix — Step 2+.
+- **No event metrics yet.** Event-level recall, false
+  alarms/hour, detection delay, cross-dataset F1 — Step 2+. The
+  `EventPredictionStream` and `EventGroundTruthWindow` contracts
+  are in place to receive them.
+- **No slice aggregator yet.** `MetricResult` already carries a
+  `slice_key`, and `ClipPrediction.slice_tags` /
+  `ClipLabel.slice_tags` are populated from `ClipRecord` via
+  `SliceTags.from_clip`. The aggregator that turns a list of
+  predictions + labels into a list of `MetricResult`s (one per
+  slice) lands in Step 2.
+- **No "detector-of-the-detector" self-test yet.** PRD: inject a
+  known-bad change (e.g. shuffled labels) and confirm the harness
+  catches it. Step 2+.
+- **No Colab notebook for Step 1.** Step 1 builds the foundation
+  but does not need a notebook — the next notebook will exercise
+  the evaluator end-to-end once a trained model exists.
+- **Issue 004 is not closed.** Code-complete for Step 1; remaining
+  acceptance criteria from `issues/004-eval-harness-and-golden-set.md`
+  land in Step 2+ (full metrics, event scaffold, detector self-test,
+  real golden-set run).
+
+---
+
+## Issue 004 Step 1 — governance correction (final-judgement only)
+
+The initial Step 1 draft allowed `EVALUATION` to read frozen records
+("operator may want to spot-check frozen behaviour without it being on
+the critical path"). The required governance rule is stricter: **the
+vault opens only on final judgement**, never on a routine eval call.
+This section documents the correction.
+
+### What changed
+
+- `evaluation/execution_context.py`
+  - `FROZEN_ALLOWED_CONTEXTS` is now
+    `frozenset({ExecutionContext.FINAL_JUDGEMENT})` — a single-entry
+    allow-list. `EVALUATION` is removed.
+  - The module / enum docstrings now state, explicitly: *"the vault
+    opens ONLY for ``FINAL_JUDGEMENT``"*. The prior "operator
+    spot-check" rationale is removed.
+  - `is_frozen_allowed(...)` still returns `True` for exactly
+    `ExecutionContext.FINAL_JUDGEMENT` and `False` for everything
+    else.
+  - `FrozenAccessError` is now produced for `EVALUATION` (in both
+    enum and string form) at both read entry points:
+    `select_clips_for_context` and `get_frozen_clips`. The error
+    message's allow-list slice now reads `Only ['final_judgement']`.
+
+- `tests/test_eval_frozen_guard.py`
+  - `test_only_final_judgement_can_see_frozen` asserts the new
+    single-entry allow-list.
+  - `test_evaluation_is_not_in_the_allow_list` — belt-and-braces
+    assertion: `EVALUATION` must NOT be in the allow-list, period.
+    A future regression that re-adds it would fail this test
+    loud.
+  - `test_evaluation_context_excludes_frozen_clips` +
+    `test_evaluation_string_form_also_excludes_frozen` replace
+    the prior *includes* cases.
+  - `test_evaluation_now_raises_frozen_access_error` +
+    `test_evaluation_string_form_raises_frozen_access_error`
+    replace the prior *can read* cases.
+  - `test_error_message_lists_only_final_judgement_as_allowed`
+    uses a `_allowed_contexts_substring` helper to confirm the
+    error's allow-list slice is exactly `['final_judgement']`.
+  - `test_final_judgement_context_includes_frozen_clips` +
+    `test_final_judgement_string_form_can_read_frozen` are kept
+    positive (FINAL_JUDGEMENT still works).
+  - All training / tuning / unknown / None / typo / arbitrary-object
+    denial cases are unchanged.
+  - `test_empty_manifest_returns_empty_list_for_allowed_context`
+    now exercises `FINAL_JUDGEMENT` (was `EVALUATION`).
+
+- `context.txt`
+  - This section.
+
+### Why this is a strict widening, not a relaxation
+
+Any code path that previously read frozen under `EVALUATION` now
+raises `FrozenAccessError` (or receives the non-frozen subset from
+`select_clips_for_context`). The contract surface did not change —
+the same two read entry points return the same shapes — but the
+policy that decides "is this context allowed?" narrowed.
+
+The mitigation for callers that legitimately needed ad-hoc frozen
+reads: declare `ExecutionContext.FINAL_JUDGEMENT`. The error message
+points them at the single allowed value.
+
+### Optional cleanup landed alongside the governance fix
+
+- **`NotAvailable.__bool__` comment fixed.** The prior comment
+  parsed as "if not_available: ... is True", which contradicted the
+  implementation. Rewritten to enumerate the four falsy / truthy
+  cases unambiguously: `bool(na)` is False; `if na:` is False;
+  `if not na:` is True; `if na.value:` is False when the value is
+  the marker. The docstring on `__bool__` is now self-consistent.
+
+- **Result-store overwrite behaviour hardened and documented.**
+  `MetricResultStore.save(...)` now defaults to refusing to replace
+  an existing run directory. The motivation:
+
+    - A `run_id` is the result's identity on disk; a silent
+      overwrite would drop prior results when a notebook is
+      re-run.
+    - Callers that genuinely want to replace a run pass
+      `overwrite=True`; the explicit kwarg flags the intent at
+      the call site.
+    - The store only removes the named payload files
+      (`results.json`, `summary.txt`) and never touches any
+      caller-managed siblings in the run directory.
+
+  Three new tests cover this:
+    - `test_overwrite_default_refuses_to_replace_existing_run` —
+      default behaviour surfaces `FileExistsError`.
+    - `test_overwrite_true_replaces_existing_run` — explicit
+      opt-in replaces the payload.
+    - `test_overwrite_only_clears_named_payload_files` — sibling
+      files placed in `run_dir` survive a re-save.
+
+  The store still has no `delete()` method: a misclick that drops
+  results is worse than one that requires a few lines of
+  `shutil.rmtree(store.run_dir("..."))` to undo.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 371 tests in 4.5s — OK    # 364 prior + 7 governance-related
+                               # (1 new allow-list assertion
+                               #  + 2 EVALUATION-deny reframes
+                               #  + 1 error-message assertion
+                               #  + 3 overwrite tests)
+```
+
+Policy checks (positive):
+
+| Context | Expected access | Test |
+|---|---|---|
+| `FINAL_JUDGEMENT` (enum + "final_judgement" string) | may read frozen | `test_final_judgement_context_includes_frozen_clips`, `test_final_judgement_can_read_frozen`, `test_final_judgement_string_form_can_read_frozen` |
+| `EVALUATION` (enum + "evaluation" string) | denied — no frozen reads | `test_evaluation_context_excludes_frozen_clips`, `test_evaluation_now_raises_frozen_access_error`, `test_evaluation_string_form_raises_frozen_access_error` |
+| `TRAINING` / `TUNING` | denied — no frozen reads | `test_training_context_excludes_frozen_clips`, `test_tuning_context_excludes_frozen_clips`, `test_training_raises_frozen_access_error`, `test_tuning_raises_frozen_access_error` |
+| `UNKNOWN` (explicit), `None`, typo, arbitrary object | denied | `test_unknown_context_denies_frozen_access`, `test_none_context_denies_frozen_access`, `test_unknown_string_context_denies_frozen_access`, `test_unknown_raises_frozen_access_error`, `test_none_raises_frozen_access_error`, `test_arbitrary_object_becomes_unknown` |
+
+The `EVALUATION` cases changed from "may read" to "denied" — the
+test names flag the inversion (`test_evaluation_now_raises_...`,
+`test_evaluation_context_excludes_...`) so a future reader sees
+this was a deliberate policy tightening, not a regression.
+
+---
+
+## Issue 002 decisions and rules
 
 ### Files created or changed
 
