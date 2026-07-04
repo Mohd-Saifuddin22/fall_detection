@@ -21,9 +21,12 @@ generator in place + Issue 004 Step 1 (eval harness foundation) in place.
   fixed-length person crops on Drive.
 - Issue 004: eval-harness foundation (Step 1) + classification
   metrics + slice-based reporting (Step 2) + detector-of-the-
-  detector self-test (Step 3). Step 3 proves the Step 2 harness
-  catches a shuffled-label corruption. Event metrics still
-  pending (Step 4+).
+  detector self-test (Step 3) + event-level metrics + component-
+  metric scaffold (Step 4). Steps 1–4 ship the data contracts,
+  the metric bundle, the self-test, and the event-level path.
+  Pipeline C post-verification alert-feeds and component-library
+  integrations (motmetrics / TrackEval) land when the projects
+  request them.
 
 Blockers for downstream issues:
 - Issue 005 (Pipeline A data prep) and Issue 008 (Pipeline B data prep)
@@ -833,6 +836,289 @@ Coverage cross-reference vs. the spec's required test cases:
 | Top-level exports | `PublicExportTests.test_top_level_exports_exist`, `test_shuffle_synthetic_labels_alias_matches_module_symbol` |
 | Synthetic builder vs. real harness | `SyntheticBaselineTests.test_baseline_auc_is_near_one` runs `compute_classification_metrics` on the output of `build_synthetic_baseline`. The runner itself does the same. |
 | Average over multiple seeded shuffles | `HealthyRunTests.test_n_shuffles_per_shuffled_values_length_match`, `ConfigDefaultsTests.test_shuffled_seeds_are_sequential_from_seed_base` |
+
+---
+
+## Issue 004 Step 4 — event-level metrics + component scaffold
+
+Step 4 lands the system/event-level metric bundle on top of the
+Step 1 event contracts. No real Le2i data is required — every
+test runs against toy synthetic streams. Pipeline C final-alert
+feeds and component-library integrations (motmetrics, TrackEval,
+pose adapters) are documented as extension seams rather than
+implemented here.
+
+### Files created
+
+| Path | Purpose |
+|---|---|
+| `evaluation/metrics/event.py` | Pure alert-derivation function (`derive_alert_frame_indices`), alert ↔ GT matching (`match_alerts_to_events` + `EventMatching`), per-clip metric bundle (`compute_event_metrics_for_clip`, `compute_event_metrics_for_stream`, `EventMetricBundle`), cross-dataset aggregator (`aggregate_event_metrics_by_dataset`), component-metric scaffold (`compute_component_metrics`). |
+| `tests/test_eval_event.py` | 44 unit tests: alert-rule shape + validation, alert derivation defaults + configurability + frame-offset, event matching tolerance + first-match + duplicate collapse + no-event path, per-clip recall/precision/F1 + delay mean/p95 in frames and seconds + fps-NotAvailable + false-alarms/hour + cross-dataset F1 + component scaffold rows + persistence round-trip. |
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `evaluation/metrics/__init__.py` | Re-exports the Step 4 types (`AlertRule`, `EventMatching`, `EventMetricBundle`, `derive_alert_frame_indices`, `match_alerts_to_events`, `compute_event_metrics_for_clip`, `compute_event_metrics_for_stream`, `aggregate_event_metrics_by_dataset`, `compute_component_metrics`, plus three `DEFAULT_*` constants). Module docstring now advertises both submodules. |
+| `evaluation/__init__.py` | Re-exports the Step 4 symbols at the package root. Top-of-file docstring adds a "Step 4 adds" bullet describing the new surface. |
+| `context.txt` | This section. |
+
+### Event-metric API contract
+
+```python
+from evaluation import (
+    DEFAULT_ALERT_THRESHOLD, DEFAULT_ALERT_PERSISTENCE,
+    DEFAULT_EVENT_TOLERANCE_FRAMES,
+    AlertRule, EventMatching, EventMetricBundle,
+    derive_alert_frame_indices,
+    match_alerts_to_events,
+    compute_event_metrics_for_clip,
+    compute_event_metrics_for_stream,
+    aggregate_event_metrics_by_dataset,
+    compute_component_metrics,
+)
+from evaluation.contracts import (
+    EventPredictionStream, EventGroundTruthWindow,
+)
+```
+
+The four-tier pipeline:
+
+1. **Alert derivation** — pure; either via the bundle
+   wrapper (`compute_event_metrics_for_stream`) or by a future
+   Pipeline C post-verification engine handing off its alert
+   frames to `compute_event_metrics_for_clip` directly.
+2. **Match** — `match_alerts_to_events(alerts, events, tolerance=0)`
+   returns an `EventMatching` carrying matched alerts / matched
+   events / unmatched alerts / unmatched events / per-match
+   delays-in-frames. First-match-per-event wins; positive
+   tolerance swallows small lead-ins and trailing edges.
+3. **Per-clip bundle** — `EventMetricBundle` exposes
+   `metric_results()` that flattens everything into
+   `MetricResult` rows the Step 1 `MetricResultStore`
+   accepts unchanged.
+4. **Cross-dataset aggregation** — `aggregate_event_metrics_by_dataset`
+   groups bundles and emits per-dataset rows tagged with
+   `SliceKey(tag="dataset", value=<dataset_name>)`.
+
+### Alert rule defaults
+
+The defaults match the PRD's post-verification starter:
+
+| Knob | Default | Source of truth |
+|---|---|---|
+| `threshold` | `0.80` | `DEFAULT_ALERT_THRESHOLD` |
+| `persistence` | `10` (consecutive frames) | `DEFAULT_ALERT_PERSISTENCE` |
+| `tolerance` | `0` (alert frame must lie inside the GT window) | `DEFAULT_EVENT_TOLERANCE_FRAMES` |
+
+`AlertRule` is a frozen dataclass — its fields are validated at
+construction (threshold in `[0, 1]`, persistence `>= 1`). All
+three defaults are exposed as module constants so callers that
+do not want to thread an `AlertRule` instance can still refer
+to them by name.
+
+The alert fires at the *last* frame of a `persistence`-sized
+chunk of consecutive above-threshold scores. After firing,
+the run is reset so a sustained high-score region produces
+one alert per chunk rather than one per frame.
+
+### `NotAvailable` behaviour
+
+The metric bundle is honest about missing inputs:
+
+| Condition | Result |
+|---|---|
+| `total_events == 0` | `event_recall` → `NotAvailable("no event GT available")` |
+| `total_events == 0` | `detection_delay_*` → `NotAvailable("no event GT available")` |
+| `triggered_alerts == 0` (no alerts fired) | `event_precision` → `NotAvailable("no alerts fired")` |
+| Either precision or recall is `NotAvailable` | `event_f1` → `NotAvailable("precision or recall undefined")` |
+| `fps` missing / `<= 0` | `false_alarms_per_hour`, `detection_delay_*_seconds` → `NotAvailable("no fps / temporal metadata")` |
+| `total_frames` missing / `<= 0` | `false_alarms_per_hour` → `NotAvailable("no fps / temporal metadata")` |
+| No matches to score | `detection_delay_mean_*` / `detection_delay_p95_*` → `NotAvailable` (no event GT available) |
+
+`false_alarms` (count), `event_recall`, `event_precision`, and
+the supporting counts (`total_events`, `matched_events`,
+`matched_alerts`, `total_alerts`) are always numeric on a
+well-formed bundle. F1 inherits `NotAvailable` whenever either
+of its inputs is `NotAvailable` — we never substitute 0.
+
+### Component-metric scaffold decisions
+
+`compute_component_metrics(...)` returns `NotAvailable` rows for
+every component metric today, with three reasons depending on
+the input shape:
+
+- `no detection ground truth` — mAP / mAP@0.5:0.95 (no detection
+  ground truth is currently staged for any dataset; URFD ships
+  raw frames only per the Issue 002 metric-limitation note).
+- `no tracking ground truth` — IDF1 / MOTA / HOTA.
+- `no pose ground truth` — PCK.
+
+When ground truth is supplied but no integration is wired in,
+the reason flips to `component metric integration pending` so
+the persisted payload makes the seam explicit. The library
+seams are documented in the module docstring:
+
+- mAP / mAP@0.5:0.95 — `sklearn.metrics.average_precision_score`.
+- IDF1 / MOTA — `motmetrics` (in `requirements.txt` line 26,
+  `motmetrics>=1.4.0`).
+- HOTA — TrackEval (manual install per
+  `colab/setup.py:TRACKEVAL_INSTALL_NOTE`).
+- PCK — vendor-agnostic pose-GT-distance adapter; not
+  implemented. Requires pose ground truth none of the
+  currently-staged datasets ship.
+
+### Reuse of Step 1 contracts + Step 1 persistence
+
+`EventMetricBundle.metric_results()` emits rows whose shape
+matches the Step 1 `MetricResultStore`'s JSON schema exactly.
+The persistence integration test
+(`PersistenceIntegrationTests.test_full_event_metric_payload_persists_and_reloads`)
+exercises the round-trip with `evaluate=False`, the bundle's
+`metric_results()`, and the aggregator's per-dataset rows in
+the same `save()` call — and confirms that recall / F1 /
+false-alarms-per-hour survive reload with the right values.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 479 tests in 6.7s — OK    # 435 prior + 44 new for Step 4
+```
+
+Coverage cross-reference vs. the spec's required test cases:
+
+| Required case | Test |
+|---|---|
+| Alert derivation with default persistence | `AlertDerivationTests.test_default_persistence_at_threshold` |
+| Configurable threshold and persistence | `AlertDerivationTests.test_configurable_threshold_and_persistence`, `AlertRuleTests.test_persistence_below_one_rejected` |
+| Externally supplied alert frames override derived alerts | `EventMetricBundleTests.test_externally_supplied_alerts_override_derivation`, `StreamWrapperTests.test_frame_offset_applied` |
+| Alert-to-event matching with tolerance | `EventMatchingTests.test_match_inside_window_zero_tolerance`, `test_tolerance_swallows_lead_in`, `test_tolerance_swallows_trailing_edge` |
+| First match per event | `EventMatchingTests.test_first_match_per_event_wins`, `test_first_match_wins_with_colliding_alerts` |
+| Unmatched alerts counted as false alarms | `EventMatchingTests.test_alert_outside_window_zero_tolerance_is_false_alarm`, `EventMetricBundleTests.test_recall_and_precision_match_hand_computed` |
+| Event recall | `EventMetricBundleTests.test_recall_and_precision_match_hand_computed`, `test_no_event_gt_returns_not_available_for_recall_and_delay` |
+| Detection delay mean and p95 in frames | `EventMetricBundleTests.test_match_delays_hand_computed`, `test_p95_handles_variegated_delays` |
+| Seconds delay returns NotAvailable without fps | `EventMetricBundleTests.test_seconds_delay_returns_not_available_without_fps` |
+| False-alarms/hour returns NotAvailable without fps | `EventMetricBundleTests.test_false_alarms_per_hour_not_available_without_fps` |
+| False-alarms/hour computes correctly with fps + total frames | `EventMetricBundleTests.test_false_alarms_per_hour_computes_with_fps` |
+| No-GT event metrics return NotAvailable | `EventMetricBundleTests.test_no_event_gt_returns_not_available_for_recall_and_delay` |
+| Cross-dataset event F1 per dataset | `CrossDatasetAggregationTests.test_per_dataset_precision_recall_f1`, `test_emits_one_set_per_dataset`, `test_dataset_with_no_gt_yields_not_available_for_recall`, `test_one_result_per_dataset_per_metric_name` |
+| Component metrics return NotAvailable with clear reasons | `ComponentScaffoldTests.test_default_returns_expected_metric_names`, `test_detection_metrics_have_no_detection_ground_truth_reason`, `test_tracking_metrics_have_no_tracking_ground_truth_reason`, `test_pose_metric_has_no_pose_ground_truth_reason`, `test_present_inputs_still_return_not_available_pending_integration` |
+| Results persist via MetricResultStore | `PersistenceIntegrationTests.test_full_event_metric_payload_persists_and_reloads` |
+
+Additional cheap coverage:
+
+- `AlertRuleTests` (3) — threshold range + persistence minimum.
+- `AlertDerivationTests` (8) — frame offset, run reset, persistence-chunk firing.
+- `EventMatchingTests` (9) — duplicate alerts dedupe, negative-tolerance rejection, alerts sorted before matching.
+- `StreamWrapperTests` (2) — wrapper derives alerts + matches in one call.
+- `ComponentScaffoldTests` (6) — slice-key propagation, no-input default surface.
+- `PersistenceIntegrationTests` (1) — full pipeline round-trip via the Step 1 store.
+
+### Known limitations (Step 5+)
+
+- **No Pipeline C verification engine hook yet.** The bundle
+  accepts externally supplied alerts but Pipeline C itself
+  ships the verification rules; this Step 4 stands ready
+  to consume them.
+- **No library integrations for component metrics.** mAP /
+  IDF1 / MOTA / HOTA / PCK return `NotAvailable` until real
+  detection / tracking / pose ground truth + motmetrics /
+  TrackEval / pose-PCK-adapter are wired up. The seams are
+  documented; library hooks land when the requesting issues
+  do.
+- **No "detector-of-the-detector" for event metrics.** The
+  Step 3 self-test covers the classification bundle;
+  a Step-5 self-test (or extension of the existing one)
+  covers event metrics — the synthetic alert-engine seam is
+  in place but not exercised yet.
+
+---
+
+## Issue 004 Step 4 — event-matching correctness fix
+
+The first pass of Step 4 honoured "first-in-window alert per
+event" but counted any alert that didn't credit an unmatched
+event as a false alarm. That misclassified redundant in-window
+alerts inside an already-matched event. The fix:
+
+### Corrected event-matching contract
+
+1. **False alarm.** An alert is a false alarm iff it falls
+   outside every ground-truth event window (including tolerance).
+2. **Matched GT event.** A GT event is matched if at least one
+   alert falls in its tolerated window.
+3. **First-match-per-event wins.** The first in-window alert
+   credits the event and sets the detection delay. Subsequent
+   alerts in the same window are silently dropped.
+4. **Redundant in-window alerts are harmless.** An alert that
+   falls in an already-matched event's window is neither an
+   additional match nor a false alarm. It does not appear in
+   ``unmatched_alerts`` and does not inflate the
+   false-alarm count or false-alarms-per-hour.
+5. **Unmatched events** are GT events with zero in-window
+   alerts.
+6. **Spurious alerts** are alerts outside every tolerated GT
+   window.
+
+### Corrected precision formula
+
+```text
+recall    = matched_event_count / total_gt_events
+precision = matched_event_count / (matched_event_count + false_alarm_count)
+f1        = 2 · precision · recall / (precision + recall)
+```
+
+The numerator is the count of GT events credited — **not** the
+count of matched alerts. The denominator counts both credited
+events and spurious alerts (false alarms). Redundant in-window
+alerts do not enter either side.
+
+### Where the change shows up
+
+- `match_alerts_to_events` (`evaluation/metrics/event.py`) has
+  a second pass: when no unmatched event covers the alert,
+  walk every event's window and silently drop the alert if any
+  covers it. Only outside-every-window alerts become
+  `unmatched_alerts`.
+- `EventMetricBundle.metric_results()` computes
+  `event_precision = matched_events / (matched_events +
+  len(unmatched_alerts))`. Previously it was
+  `matched_alerts / (matched_alerts + len(unmatched_alerts))`.
+- `aggregate_event_metrics_by_dataset` reflects the same
+  numerator shift: per-dataset `event_precision` uses the
+  count of matched events across the dataset's bundles, not
+  the count of matched alerts.
+- `false_alarms_per_hour` continues to use
+  `len(unmatched_alerts)` — but with the redundant alerts
+  filtered out at the matcher, that count is now an honest
+  spurious-alert count.
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `evaluation/metrics/event.py` | Matcher's second-pass "is this alert inside any window?" check. Precision formula updated to `matched_events / (matched_events + len(unmatched_alerts))`. Aggregator's per-dataset precision mirrors the same numerator. |
+| `tests/test_eval_event.py` | New: `test_redundant_in_window_alerts_are_not_false_alarms` and `test_redundant_in_window_does_not_change_per_metric_results` (the brief's example: GT [100, 130], alerts 109/119/129 → false_alarms=0, recall=1.0, precision=1.0, delay=9 frames). Updated: `test_first_match_wins_with_colliding_alerts` (redundant second alert in matched window is now correctly excluded from `unmatched_alerts`); `test_per_dataset_precision_recall_f1` (precision formula now uses matched_events). |
+| `context.txt` | This section. |
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 481 tests in 6.5s — OK    # 479 prior + 2 new (sustained-fall coverage)
+```
+
+Live smoke test of the brief's example:
+
+```
+GT [100, 130], alerts [109, 119, 129]
+- false_alarms              : 0
+- event_recall              : 1.0
+- event_precision           : 1.0
+- detection_delay_mean      : 9 frames
+- false_alarms_per_hour     : 0  (with fps=30, total_frames=900)
+```
 
 ---
 

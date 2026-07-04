@@ -1,10 +1,11 @@
-"""Evaluation harness public surface for Step 1 + Step 2 + Step 3 (Issue 004).
+"""Evaluation harness public surface for Step 1 + Step 2 + Step 3 + Step 4 (Issue 004).
 
 Re-exports contracts, the NotAvailable marker, the execution-context
 frozen-tier guard, the result-persistence stub, the clip-level
-classification metrics bundle, and the detector-of-the-detector
-self-test so notebooks and pipeline code can ``from evaluation
-import ...`` without reaching into submodules.
+classification metrics bundle, the detector-of-the-detector
+self-test, and the event-level metric bundle so notebooks and
+pipeline code can ``from evaluation import ...`` without reaching
+into submodules.
 
 Step 1 establishes:
 
@@ -34,6 +35,20 @@ Step 3 adds:
   that proves the Step 2 harness catches a shuffled-label corruption.
   Synthetic baseline + deterministic seeded shuffles + injected
   scorer hook so the test has teeth against a broken / lying harness.
+
+Step 4 adds:
+
+- An event-level metric bundle (event-level recall, false alarms /
+  hour, detection delay mean + p95 in frames and seconds,
+  cross-dataset event F1) on top of the Step 1 event contracts.
+- A pure alert-derivation function (threshold + persistence) and an
+  externally-suppliable alert-frame path so a future Pipeline C
+  verification engine can feed final alerts without rewriting the
+  metrics.
+- A component-metric scaffold (mAP / IDF1 / MOTA / HOTA / PCK) that
+  returns ``NotAvailable`` rows with precise reasons until real
+  detection / tracking / pose ground truth + library integrations
+  (sklearn / motmetrics / TrackEval) land.
 """
 
 from evaluation.contracts import (
@@ -77,6 +92,20 @@ from evaluation.metrics.classification import (
     SliceMetricReport,
     SupportCounts,
     compute_classification_metrics,
+)
+from evaluation.metrics.event import (
+    DEFAULT_ALERT_PERSISTENCE,
+    DEFAULT_ALERT_THRESHOLD,
+    DEFAULT_EVENT_TOLERANCE_FRAMES,
+    AlertRule,
+    EventMatching,
+    EventMetricBundle,
+    aggregate_event_metrics_by_dataset,
+    compute_component_metrics,
+    compute_event_metrics_for_clip,
+    compute_event_metrics_for_stream,
+    derive_alert_frame_indices,
+    match_alerts_to_events,
 )
 from evaluation.self_test import (
     SelfTestConfig,
@@ -125,6 +154,19 @@ __all__: tuple[str, ...] = (
     "SupportCounts",
     "SliceMetricReport",
     "compute_classification_metrics",
+    # event metrics + component scaffold (Step 4)
+    "DEFAULT_ALERT_THRESHOLD",
+    "DEFAULT_ALERT_PERSISTENCE",
+    "DEFAULT_EVENT_TOLERANCE_FRAMES",
+    "AlertRule",
+    "EventMatching",
+    "EventMetricBundle",
+    "derive_alert_frame_indices",
+    "match_alerts_to_events",
+    "compute_event_metrics_for_clip",
+    "compute_event_metrics_for_stream",
+    "aggregate_event_metrics_by_dataset",
+    "compute_component_metrics",
     # detector-of-the-detector (Step 3)
     "SelfTestConfig",
     "SelfTestResult",
