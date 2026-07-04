@@ -22,12 +22,10 @@ generator in place + Issue 004 Step 1 (eval harness foundation) in place.
 - Issue 004: eval-harness foundation (Step 1) + classification
   metrics + slice-based reporting (Step 2) + detector-of-the-
   detector self-test (Step 3) + event-level metrics + component-
-  metric scaffold (Step 4) + Le2i annotation parser (Step 5).
-  Steps 1–5 ship the data contracts, the metric bundle, the
-  self-test, the event-level path, and the first dataset's GT
-  adapter. Pipeline C post-verification alert-feeds and
-  component-library integrations (motmetrics / TrackEval) land
-  when the projects request them.
+  metric scaffold (Step 4) + Le2i annotation parser (Step 5);
+  Issue 005 Step 1 = VideoMAE-ready crop-shard loader.
+  Step 1 ships the Pipeline A data-prep layer; classifier
+  head + training land in subsequent Issue 005 steps.
 
 Blockers for downstream issues:
 - Issue 005 (Pipeline A data prep) and Issue 008 (Pipeline B data prep)
@@ -2306,6 +2304,164 @@ shard format.
   loader's regex may need to be widened — flagged for review.
 - **Colab Secrets are persistent across sessions for a given user.**
   They are not stored on Drive.
+
+---
+
+## Issue 005 Step 1 — VideoMAE-ready crop-shard loader
+
+Pipeline A data-prep layer. Reads Issue 003 WebDataset-style
+``.tar`` crop shards and assembles each clip / window into a
+VideoMAE-ready ``(T, 3, H, W)`` float32 tensor, with provenance
+and missing-frame mask preserved. No model code, no
+perception code, no metrics — pure data prep.
+
+### Files created
+
+| Path | Purpose |
+|---|---|
+| `pipeline_a/__init__.py` | Re-exports the Pipeline A surface at the package boundary. |
+| `pipeline_a/load_crops.py` | The loader: `load_clip_tensor_from_shards`, `load_clip_batch_from_shards`, `list_clip_keys`, `read_videomae_constants`, `LoadedClip` container, exception types. |
+| `tests/test_load_crops.py` | 36 unit tests on synthetic shards written through the Issue 003 `ShardWriter`. No real Colab shards. |
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `context.txt` | This section. |
+
+### VideoMAE tensor contract
+
+```
+single clip: (T, C, H, W)
+batch:       (B, T, C, H, W)
+T ∈ {16, 32}     → ALLOWED_T              (default 16 → DEFAULT_T)
+C = 3            → NUM_CHANNELS          (RGB)
+H = W = 224      → IMAGE_SIZE             (HF videomae-base size.shortest_edge)
+dtype            = float32
+channel order    = RGB
+```
+
+The loader does NOT silently pad or truncate. A clip with
+fewer or more than ``T`` frames surfaces as
+`InvalidClipLengthError` ("too many") or `MissingFrameOffsetError`
+("too few") — calling sites see the exact failure mode.
+
+### Normalisation contract
+
+The loader is pinned to HF `VideoMAEImageProcessor` defaults
+for `"MCG-NJU/videomae-base"`:
+
+```
+image_mean = [0.485, 0.456, 0.406]    IMAGENET_MEAN
+image_std  = [0.229, 0.224, 0.225]    IMAGENET_STD
+size       = 224 (shortest_edge)      IMAGE_SIZE
+```
+
+The unit test
+`test_local_constants_pinned_to_videomae_base` loads the
+processor from the local HF cache and asserts the constants
+match. A future processor-default drift trips the test
+suite. The fallback path (`test_local_constants_are_documented_imagenet_values`)
+guards against any environment where the HF cache is empty.
+
+Pure-numpy normalisation pipeline
+(`uint8 → [0, 1] → (x − mean) / std`) — no torch / torchvision
+dependency, consistent with the Issue 001 review note that
+torch is intentionally absent from the dev environment.
+
+### Label / provenance contract
+
+| Field | Source | Notes |
+|---|---|---|
+| `label` (string) | per-frame metadata | "fall" / "no_fall" — only legal values. `label_to_int` / `int_to_label` encode 0 / 1; anything else raises. |
+| `clip_id`, `dataset`, `track_id`, `source_path` | per-frame metadata | enforced consistent across all frames in one clip — disagreement raises `InconsistentClipProvenanceError`. |
+| `missing_frame` | per-frame metadata | preserved bit-for-bit on `LoadedClip.missing_mask`. |
+| `coverage` | per-frame metadata | aggregated as the mean across frames on `LoadedClip.coverage`. |
+| `missing_frame_count` | computed | int sum of `missing_mask`. |
+| `frame_indices`, `frame_offsets` | per-frame metadata | preserved as numpy arrays / tuples. |
+| `shard_filename` | (loader) | comma-joined list of source shards. |
+
+### Required metadata fields
+
+The loader rejects any clip whose `.meta.json` sidecar is
+missing any of (raises `MissingMetadataFieldError`):
+
+```
+clip_id, dataset, label, track_id,
+frame_index, frame_offset, source_path
+```
+
+### Frame-offset ordering
+
+Frames are sorted by **numeric** `frame_offset`, not by tar
+member name. The hard contract:
+
+- Offsets are deduplicated before contiguity check.
+- `frame_offsets` must equal `range(0, T)` exactly.
+- Duplicate offsets raise `DuplicateFrameOffsetError`.
+- Offsets missing from `0..T-1` raise `MissingFrameOffsetError`.
+
+The "sort by numeric offset" rule is exercised against a tar
+written with `offsets_in_storage_order = [9, 0, 5, 1, 4, 2, 7, 3, 6, 8, 10, 11, 12, 13, 14, 15]` —
+the loader still produces a contiguous ``0..15`` clip sorted by
+`frame_offset`.
+
+### Missing-shard error message
+
+`CropShardsMissingError(FileNotFoundError)` carries the
+"Run Issue 003 first" hint at the front of the message:
+
+```
+Crop shard file(s) not found: /path/to/missing.tar.
+Run Issue 003 (the cropping pipeline) first to produce shards,
+or verify the path passed to load_clip_tensor_from_shards().
+```
+
+### What Step 1 deliberately does NOT do
+
+- No VideoMAE model load or fine-tune. (Issue 005 Step 2+.)
+- No metric computation. (Issue 007 / 010 / 013 / 014 / 015.)
+- No YOLO / ByteTrack / perception / crop-runner imports.
+  This loader only reads shards Issue 003 already produced
+  on disk.
+- No torch / torchvision. Normalisation is pure numpy.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 553 tests in 14.3s — OK    # 517 prior + 36 new for Issue 005 Step 1
+
+$ python -c "from pipeline_a import IMAGENET_MEAN, IMAGENET_STD; \
+              print('mean:', IMAGENET_MEAN); print('std:', IMAGENET_STD)"
+mean: (0.485, 0.456, 0.406)
+std: (0.229, 0.224, 0.225)
+```
+
+Coverage cross-reference vs. the spec's required test cases:
+
+| Required case | Test |
+|---|---|
+| Tensor shape, dtype, RGB channel behaviour | `TensorShapeTests.test_tensor_shape_is_t_c_h_w`, `test_tensor_dtype_is_float32`, `test_uint8_frames_shape_is_t_h_w_3`, `test_rgb_channel_order_preserved` |
+| Normalisation constants match VideoMAE processor defaults | `NormalizationTests.test_local_constants_pinned_to_videomae_base`, `test_local_constants_are_documented_imagenet_values`, `test_tensor_normalisation_is_byte_exact_at_clip_level` |
+| Label encoding correctness | `LabelEncodingTests.test_no_fall_to_zero`, `test_fall_to_one`, `test_int_to_label_round_trip`, `test_unknown_label_raises` |
+| Provenance round-trip | `ProvenanceRoundTripTests.test_required_provenance_fields_round_trip` |
+| Missing-frame mask round-trip | `ProvenanceRoundTripTests.test_missing_mask_round_trips`, `test_coverage_is_average_over_frames`, `test_frame_indices_and_offsets_round_trip`, `test_shard_filename_provenance` |
+| Frame offsets sorted correctly | `FrameOffsetSortTests.test_loader_sorts_by_numeric_offset_not_member_name` |
+| Duplicate frame offset raises | `FailurePathTests.test_duplicate_frame_offset_raises` |
+| Missing frame offset raises | `FailurePathTests.test_missing_frame_offset_raises`, `test_clip_with_too_few_frame_count_raises_missing_offset` |
+| Inconsistent metadata across frames raises | `FailurePathTests.test_inconsistent_provenance_raises` |
+| Invalid `T` raises | `FailurePathTests.test_invalid_T_raises`, `test_default_T_is_16`, `test_allowed_T_pins_to_16_and_32` |
+| Missing required metadata raises | `FailurePathTests.test_missing_required_metadata_field_raises` |
+| Missing shard path raises with clear "Issue 003 first" message | `FailurePathTests.test_missing_shard_path_raises_with_clear_message`, `test_list_clip_keys_missing_file_raises_crop_shards_error` |
+| 2–3 synthetic clips exercised via Issue 003 `ShardWriter` | `BatchLoaderTests`, `ProvenanceRoundTripTests`, `TensorShapeTests.setUp` |
+
+Additional cheap coverage:
+
+- `BatchLoaderTests` (3) — batch shape, order, empty-clip-keys rejection.
+- `ConvenienceTests` (3) — `list_clip_keys`, `read_videomae_constants` round-trip.
+- `ModuleSurfaceTests` (2) — `pipeline_a` re-exports the brief's required surface; `REQUIRED_METADATA_FIELDS` matches the brief verbatim.
+- `TensorShapeTests` (4) — T × C × H × W shape; float32 dtype; uint8 RGB raw frames; channel-order preservation.
 
 ---
 
