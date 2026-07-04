@@ -35,11 +35,14 @@ logs/setup_run_log.json
 artifacts/crops/
 artifacts/skeletons/
 artifacts/checkpoints/
-metrics/
+# Anchored to repo root: this is the Drive metrics-output dir. WITHOUT the
+# leading slash this also swallowed evaluation/metrics/ (project source).
+/metrics/
 
 # Raw and intermediate dataset material — lives on Drive only.
 # The manifest references these by path; they are never in git.
-datasets/
+# Anchored to repo root so it can't swallow a nested source dir named datasets/.
+/datasets/
 *.tar
 *.tar.gz
 *.mp4
