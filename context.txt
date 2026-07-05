@@ -3293,6 +3293,242 @@ in this step — that lands as a follow-up that consumes
 
 ---
 
+## URFD window labeling — Step 3
+
+The Issue 005+ pipeline now turns authoritative per-frame
+URFD labels into clean window labels at training time. The
+labels are NOT baked into crop shards — a future rule change
+swaps the labelling without re-cropping.
+
+### Public signature
+
+```python
+from data.urfd_labels import (
+    CSVLabels,                     # from Step 2
+    DefaultWindowLabelingRule,     # default rule
+    WindowLabelingRule,            # base class for swap-ins
+    WindowLabelingError,
+    WINDOW_LABEL_FALL, WINDOW_LABEL_NO_FALL,
+    clip_id_to_sequence,
+    label_window,
+)
+
+label, is_confuser = label_window(
+    clip_id="urfd-debug-fall-01-cam0-rgb",
+    frame_indices=[1, 2, ..., 16],
+    csv_labels=parsed,
+    # frame_index_offset=0 by default — see "Frame-index alignment"
+    # below.
+    # labeling_rule=DefaultWindowLabelingRule() — Issue 006 can
+    # pass a different subclass to swap the rule.
+)
+```
+
+`label` is one of :data:`WINDOW_LABEL_FALL` /
+:data:`WINDOW_LABEL_NO_FALL` (strings, matching the rest of
+the pipeline). `is_confuser` is a bool flag the loader can
+filter on.
+
+### Default rule
+
+Fall clips:
+    - if any frame in the window has label ``0`` (falling) or
+      ``1`` (lying), the window is **fall**.
+    - if every frame in the window is ``-1`` (upright), the
+      window is **no_fall** — the pre-fall region of a fall
+      clip is a clean negative, NOT a noisy positive.
+
+ADL clips:
+    - always **no_fall** (the source clip type is non-fall).
+    - if any frame in the window has label ``1`` (lying), the
+      window is flagged ``is_confuser=True`` so a downstream
+      training run can choose to mix it into the no-fall pool,
+      weight it down, or drop it. The default keeps the flag on
+      so the evaluation can study confuser-aware behaviour
+      without further label surgery.
+
+### Frame-index alignment decision
+
+The brief flagged a potential offset between the crop metadata
+and the URFD CSV's `frame_number`:
+
+- URFD CSV `frame_number` is 1-based.
+- University RGB filenames are 1-based
+  (`fall-01-cam0-rgb-001.png`).
+- The Issue 002 perception layer and Issue 003 cropping
+  layer carry the 1-based absolute frame index forward —
+  `frame_index` in `cropping.track_windows.TrackedBox` and
+  `window.frame_indices` on `TrackWindow` are 1-based. The
+  crop metadata sidecar persists `"frame_index": frame_idx`
+  (1-based).
+
+So the caller's default is `frame_index_offset=0` (no shift).
+`label_window` exposes `frame_index_offset` as an explicit
+parameter so a future change to the crop metadata's
+frame-indexing convention can be applied at the call site — a
+single number that documents the alignment, not a silent
+assumption.
+
+### Guard behavior
+
+Every malformed input raises `WindowLabelingError` (a
+`ValueError` subclass) with a message that identifies the
+specific problem:
+
+- `frame_indices` is empty.
+- `clip_id` does not match the expected
+  `urfd-debug-<sequence>-cam0-rgb` shape.
+- The mapped sequence's CSV labels are not contiguous
+  (`CSVLabels.is_contiguous` returns `False`). A
+  half-staged tree must not produce clean training examples.
+- Any frame index in the window, after `frame_index_offset` is
+  applied, is missing from the CSV labels.
+- A non-integer frame index in the caller's list.
+- A non-positive adjusted frame index.
+
+### Pluggable rule
+
+`WindowLabelingRule` is an abstract base with one method:
+
+```python
+class WindowLabelingRule:
+    def apply(self, clip_type, per_frame_labels) -> tuple[str, bool]:
+        raise NotImplementedError
+```
+
+The default rule is `DefaultWindowLabelingRule`. Issue 006 can
+construct a different subclass (e.g. a stricter rule that only
+credits `label == 1` as fall) and pass it to `label_window`
+without re-cropping. The test suite proves this with
+`StrictFallbackRule` — the same window under a stricter rule
+returns `no_fall` where the default returns `fall`.
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `data/urfd_labels.py` | Added `clip_id_to_sequence`, `sequence_to_clip_type`, `WindowLabelingRule`, `DefaultWindowLabelingRule`, `DEFAULT_WINDOW_LABELING_RULE`, `WINDOW_LABEL_FALL`, `WINDOW_LABEL_NO_FALL`, `WindowLabelingError`, and `label_window`. Module docstring updated with the alignment decision + the public surface. |
+| `tests/test_label_window.py` | New — 22 unit tests: clip-id mapping (4), fall default rule (4), ADL default rule (3), guards (6), frame-index offset (2), pluggable rule (3). |
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 652 tests in 17.8s — OK    # 630 prior + 22 new for window labeling
+
+$ python scripts/verify_notebook.py colab/000_full_pipeline.ipynb
+Local imports   : OK (0 error(s))
+Status          : OK — notebook is ready for Colab
+```
+
+The default rule produces the brief's expected outcomes:
+fall-window with all `-1` → `no_fall` (clean negative, not
+noisy positive); fall-window with any `0` or `1` → `fall`;
+ADL-window with any `1` → `no_fall, is_confuser=True`;
+ADL-window with all `-1` → `no_fall, is_confuser=False`.
+Every guard raises `WindowLabelingError` with a message
+identifying the specific failure (empty indices, unknown
+clip id, non-contiguous sequence, missing frame,
+non-integer frame, non-positive adjusted frame).
+
+---
+
+## URFD window labeling — sparse-label fix
+
+### Finding
+
+Real university ADL CSVs are sparse: some RGB frames have
+no corresponding CSV label row. The Step 3 first cut raised
+`WindowLabelingError` on a missing frame and on a
+non-contiguous sequence — both legitimate states of a real
+sparse ADL CSV. The first run on a real ADL cluster crashed
+inside the loader: the first window of an ADL clip asked for
+labels on frames 1..16, the CSV only labelled frames 6..150,
+the function raised, the pipeline stopped.
+
+### Revised missing-label contract
+
+:func:`label_window` no longer treats sparse labels as a
+bug:
+
+- The `is_contiguous(sequence)` gate is removed. A
+  half-staged tree is no longer a hard stop; the helper
+  remains on `CSVLabels` for callers who want to audit the
+  CSV independently.
+- A missing frame index in the window's `frame_indices`
+  is **silently skipped** rather than raised. Real ADL
+  CSVs skip frames; the function collects only the labels
+  that exist and passes them to the labelling rule.
+- A non-contiguous CSV no longer blocks labelling. The
+  `is_contiguous` helper is informational; it is not a
+  guard.
+
+### New sentinel: `WINDOW_LABEL_UNLABELED = "unlabeled"`
+
+The default rule's zero-availability paths return explicit
+outcomes rather than `("no_fall", False)` (which would
+silently treat "no labels" as "all negative"):
+
+- **Fall clip, zero available labels** → the sentinel
+  `WINDOW_LABEL_UNLABELED`. Issue 006 can drop the
+  example deterministically; the sentinel is a third
+  state distinct from both `fall` and `no_fall`.
+- **ADL clip, zero available labels** → `(WINDOW_LABEL_NO_FALL,
+  False)`. A zero-label ADL window is still "no_fall by
+  source-clip type"; the confuser flag requires a positive
+  label-1 signal, which a sparse label set cannot produce.
+
+### Guard behaviour (unchanged for genuine bugs)
+
+`WindowLabelingError` is still raised, but ONLY for genuine
+bugs:
+
+- `frame_indices` is empty.
+- `clip_id` does not match `urfd-debug-<sequence>-cam0-rgb`.
+- A non-integer frame index in the caller's list.
+- A non-positive adjusted frame index.
+
+A missing frame or a non-contiguous CSV is **not** a failure
+mode. The function handles both silently and continues.
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `data/urfd_labels.py` | Added `WINDOW_LABEL_UNLABELED = "unlabeled"`. Default rule's `apply(...)` now handles an empty `per_frame_labels`: fall → `WINDOW_LABEL_UNLABELED`; ADL → `(WINDOW_LABEL_NO_FALL, False)`. `label_window(...)` no longer calls `csv_labels.is_contiguous(...)` and no longer raises on missing frames — it collects only the labels that exist. Module docstring updated with the sparse-label note. `__all__` exports the new sentinel. |
+| `tests/test_label_window.py` | Replaced `test_non_contiguous_sequence_raises` and `test_missing_frame_raises` with positive tests that prove the new behaviour: the function does not raise, the missing frame is skipped, and the window is labelled from the available frames. New `RealisticFallFixtureTests` (3 tests), `SparseAdlFixtureTests` (4 tests), and `ZeroLabelFallFixtureTests` (2 tests) cover the brief's required realistic-shape scenarios. |
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 661 tests in 85.0s — OK    # 652 prior + 9 new for the sparse-label fix
+
+$ python scripts/verify_notebook.py colab/000_full_pipeline.ipynb
+Local imports   : OK (0 error(s))
+Status          : OK — notebook is ready for Colab
+```
+
+The realistic-shape tests exercise the contract end-to-end:
+
+- Real fall sequence (frames 1..82 upright, 83..112
+  falling, 113..160 lying): pre-fall window 1..32 →
+  `no_fall`; window spanning frame 83 → `fall`; lying-tail
+  window → `fall`.
+- Real sparse ADL sequence (labelled 6..150, frame 7
+  missing, all -1): window 1..16 → `no_fall` (no crash);
+  window over the missing-frame gap → `no_fall` (no crash);
+  zero-label window → `(no_fall, False)`.
+- Fall window with no available labels (frames 200..216
+  against a 1..160 CSV) → `WINDOW_LABEL_UNLABELED` (no
+  crash).
+
+`is_contiguous(sequence)` remains on `CSVLabels` for callers
+who want to audit the CSV independently — the contract
+change is: it's no longer a hard gate inside `label_window`.
+
+---
+
 ## File layout (after Issue 002)
 
 ```
