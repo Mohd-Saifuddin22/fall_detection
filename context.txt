@@ -2930,6 +2930,247 @@ regardless of which optional dependencies are installed.
 
 ---
 
+## URFD university source — Step 1
+
+The Kaggle mirror of URFD remains a working source — but the
+project's authoritative source is now the University of Rzeszów
+page:
+
+    https://fenix.ur.edu.pl/~mkepski/ds/data/
+
+### Source decision
+
+- The university page publishes the cam0 RGB zips (fall-01..30 +
+  adl-01..40) and both label CSVs (`urfall-cam0-falls.csv`,
+  `urfall-cam0-adls.csv`) as **direct downloads** — no Kaggle
+  credentials required.
+- The Kaggle stager (`data/stage_urfd.py`) is kept for back-up
+  use (env-var-driven, opt-in) but is **no longer the default** —
+  the docs in this section, the next-step migration plan, and
+  the Issue 005+ pipeline all point at the university source.
+- A strict whitelist (one base URL, scheme-strict https) prevents
+  a future typo from silently pulling URFD from a different host.
+
+### Files created
+
+| Path | Purpose |
+|---|---|
+| `data/stage_urfd_university.py` | Whitelist + URL builders + zip-download/verify/extract loop + CSV persistence + structured result. Network calls are linear-retry (3 attempts). |
+| `tests/test_stage_urfd_university.py` | 24 unit tests: whitelist enforcement (5), URL coverage (4), idempotency (4), happy-path staging (3), corrupt-zip failures (3), folder-name parsing (4), structured result shape (1). |
+
+### Staging contract
+
+```
+ALLOWED_UNIVERSITY_BASE_URL  = "https://fenix.ur.edu.pl/~mkepski/ds/data/"
+FALL_SEQUENCES                = (1..30)        → 30 zip URLs
+ADL_SEQUENCES                 = (1..40)        → 40 zip URLs
+CAMERA_SUFFIX                  = "cam0-rgb"
+FALL_CSV_FILENAME              = "urfall-cam0-falls.csv"
+ADL_CSV_FILENAME               = "urfall-cam0-adls.csv"
+```
+
+70 frame-zip URLs (30 fall + 40 adl) + 2 CSV URLs. URL pattern
+`{base_url}/{fall|adl}-{NN:02d}-cam0-rgb.zip`.
+
+### Marker / idempotency behaviour
+
+- Marker filename: ``.staged_from_university.txt``. Records
+  ``staged_from=<base_url>`` and the per-class zip count.
+- `is_urfd_university_already_staged(staged_root)` returns
+  ``True`` only when the marker AND every expected file is
+  present: 30 fall clip folders + 40 adl clip folders + 2 CSVs.
+  A half-staged tree does NOT pass — the marker alone is not
+  enough.
+- Re-runs short-circuit; `force=True` re-downloads.
+- On any download / verification / extract failure, the run
+  raises `RuntimeError` with the per-file failure summary, and
+  the marker is NOT written. A half-staged tree is never marked
+  "complete".
+- Existing manifest / frame-reader pipeline unchanged: the
+  extracted folder names are `fall-NN-cam0` / `adl-NN-cam0`
+  (no `-rgb.zip` suffix), and the manifest builder sees the same
+  folder convention as the Kaggle mirror.
+
+### CSV persistence rule
+
+CSVs are written to `<staged_root>/csvs/` — a **persistent
+location** under the staged root that survives `Run All`
+re-runs on Colab. The script never overwrites an existing
+staged tree unless `force=True` is set, and the CSV path lives
+under the same marker-gated directory so a "complete" tree
+always has both the frames and the labels.
+
+### Corrupt-zip contract
+
+Each downloaded zip is verified with `zipfile.ZipFile.testzip()`
+BEFORE extraction. A truncated or corrupt zip fails loud:
+`RuntimeError: Truncated or corrupt zip from <url>`. The
+extraction never begins on a bad zip — so a half-staged tree
+never carries a "complete clip" that's actually a corrupt
+archive.
+
+### Files left untouched
+
+- `data/stage_urfd.py` — the Kaggle mirror remains a working
+  back-up stager. `stage_urfd_from_kaggle` continues to work
+  unchanged. It is **not** the default; the new
+  `data/stage_urfd_university.py` is.
+- `colab/000_full_pipeline.ipynb` — not edited in this step
+  (per the brief). A follow-up step will switch the notebook
+  to call the new stager by default.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 600 tests in 22.8s — OK    # 576 prior + 24 new for the university stager
+
+$ python -c "from data.stage_urfd_university import build_frame_zip_urls, build_csv_urls, ALLOWED_UNIVERSITY_BASE_URL
+frame_zip_count = len(build_frame_zip_urls())
+csv_count = len(build_csv_urls())
+print(f'frame_zip_count={frame_zip_count}')
+print(f'csv_count={csv_count}')
+print(f'first_zip={build_frame_zip_urls()[0]}')
+print(f'last_zip={build_frame_zip_urls()[-1]}')"
+frame_zip_count=70
+csv_count=2
+first_zip=https://fenix.ur.edu.pl/~mkepski/ds/data/fall-01-cam0-rgb.zip
+last_zip=https://fenix.ur.edu.pl/~mkepski/ds/data/adl-40-cam0-rgb.zip
+```
+
+The university stager is the new authoritative default. A
+follow-up Issue 005+ step will migrate the notebook to call
+`stage_urfd_from_university(...)` instead of the Kaggle
+mirror's `stage_urfd_from_kaggle(...)`.
+
+---
+
+## URFD university stager — folder-name fix
+
+### Bug description
+
+The first cut of the stager produced folder names like
+`fall-01-cam0` (stripped the `-rgb` suffix). The brief's
+verification pass caught this: the real university archive
+extracts to a folder NAMED `fall-01-cam0-rgb` (the `-rgb` is the
+on-disk folder name, not just a zip name suffix), and the
+existing manifest builder forms clip ids by appending
+`folder.folder_name` verbatim. Stripping `-rgb` would have
+diverged from the on-disk folder name and produced clip ids
+that do not match the file system, breaking the
+folder-name ↔ manifest-id contract.
+
+Worse, downstream consumers that look up the staged tree by
+folder name (the cropping runner, the perception stage, the
+Issue 003 manifest builder) would all see a different name
+than the on-disk tree — silent divergence is the worst kind of
+failure mode for a dataset loader.
+
+### Corrected folder contract
+
+The corrected `_url_to_clip_folder_name`:
+
+```
+fall-01-cam0-rgb.zip  →  fall-01-cam0-rgb
+```
+
+Only the ``.zip`` archive extension is stripped. The ``-rgb``
+suffix is preserved. The on-disk layout after a full staging
+run is:
+
+```
+<staged_root>/datasets/urfd/
+    fall-01-cam0-rgb/
+        fall-01-cam0-rgb/
+            fall-01-cam0-rgb-001.png
+            fall-01-cam0-rgb-002.png
+            ...
+            fall-01-cam0-rgb-160.png
+    adl-01-cam0-rgb/
+        adl-01-cam0-rgb/
+            adl-01-cam0-rgb-001.png
+            ...
+    ... (70 clip folders total)
+    csvs/
+        urfall-cam0-falls.csv
+        urfall-cam0-adls.csv
+    .staged_from_university.txt
+```
+
+The double-nested shape is the real archive's behaviour: the
+zip contains one top-level folder named like the clip
+(`fall-01-cam0-rgb/`), with an inner folder of the same name
+that holds the actual frame PNGs. The existing
+:class:`perception.frames.FrameFolderReader` already detects
+and descends into this layout.
+
+### Test fixture correction
+
+The synthetic zip builder now mirrors the real layout:
+
+```
+top-level folder:    fall-01-cam0-rgb/
+inner folder:        fall-01-cam0-rgb/
+frame files:         fall-01-cam0-rgb-001.png
+                     fall-01-cam0-rgb-002.png
+                     ... (1-based, 3-digit zero-padded)
+```
+
+The test fixture builds 4 synthetic frames per clip and a
+sample CSV. The tests now assert:
+
+- The staged folder is named `fall-01-cam0-rgb` (not
+  `fall-01-cam0`).
+- The inner folder is also `fall-01-cam0-rgb` and contains the
+  4 synthetic frames in temporal order
+  (`fall-01-cam0-rgb-001.png` … `…-004.png`).
+- `build_urfd_manifest` parses the staged tree and yields
+  clip ids `urfd-debug-fall-NN-cam0-rgb` and
+  `urfd-debug-adl-NN-cam0-rgb` (with the right labels).
+- `FrameFolderReader` returns the 4 frames in temporal order
+  via its numeric-frame sort, descending into the inner
+  matching subfolder.
+
+### Real-archive reference
+
+- The `fall-01-cam0-rgb.zip` (and every other fall/adl zip)
+  carries 160 frames.
+- Frame files are 1-based and 3-digit zero-padded
+  (`fall-01-cam0-rgb-001.png` … `…-160.png`).
+- The full 70-clip download is roughly 4 GB.
+
+These are recorded in the module docstring of
+`data/stage_urfd_university.py` so a future reviewer doesn't
+have to reverse-engineer the on-disk shape from the test
+fixtures.
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `data/stage_urfd_university.py` | `_url_to_clip_folder_name` strips only the ``.zip`` extension, preserving the `-rgb` suffix. `expected_files` uses the real `fall-NN-cam0-rgb` / `adl-NN-cam0-rgb` folder names. `parse_university_folder_name` docstring updated to spell out the `-rgb` shape. Module docstring adds a "Real university zip shape" section with the 160-frame / 1-based / 3-digit / 4 GB reference. |
+| `tests/test_stage_urfd_university.py` | `_zip_bytes` synthetic builder now mirrors the real double-nested shape: top-level `fall-01-cam0-rgb/` containing inner `fall-01-cam0-rgb/` with `…-001.png` … `…-004.png`. New `ManifestCompatibilityTests` class (4 tests) verifies the cross-module invariant: the staged folder is named correctly, the inner folder is correct, the manifest builder parses the staged tree to `urfd-debug-fall-NN-cam0-rgb`, and `FrameFolderReader` finds the synthetic frames in temporal order. |
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 604 tests in 72.4s — OK    # 600 prior + 4 new cross-module compatibility tests
+
+$ python scripts/verify_notebook.py colab/000_full_pipeline.ipynb
+Local imports   : OK (0 error(s))
+Status          : OK — notebook is ready for Colab
+```
+
+The university stager's staged output now matches the real
+university zip structure. The existing manifest / frame-reader
+pipeline continues to work unchanged — the only contract that
+changed is the on-disk folder name (from `fall-01-cam0` to
+`fall-01-cam0-rgb`), and that change is exactly what keeps the
+manifest clip id in sync with the on-disk folder.
+
+---
+
 ## File layout (after Issue 002)
 
 ```
