@@ -202,15 +202,33 @@ def _verify_base_url(base_url: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def expected_files(staged_root: Path) -> tuple[Path, ...]:
+#: Default persistent location for the two label CSVs. Frames
+#: live on a local fast disk (``layout.dataset_root``); labels live
+#: on the artefact root (``layout.artifact_root``) so a fresh
+#: ``Run All`` on Colab keeps the labels without re-downloading
+#: them — the labels are the slow-to-produce, fast-to-load
+#: side of the project.
+DEFAULT_CSV_LABEL_SUBDIR: str = "artifacts/urfd_labels"
+
+
+def csv_label_root(csv_root: Path) -> Path:
+    """Return the directory the two label CSVs persist under."""
+    return csv_root / DEFAULT_CSV_LABEL_SUBDIR
+
+
+def expected_files(
+    staged_root: Path, csv_root: Path
+) -> tuple[Path, ...]:
     """Every file the marker requires to be present for "fully staged".
 
     The marker alone isn't enough — the marker is one marker, but
     a half-staged tree could carry it. We require every file the
     script intends to write:
-        - 30 fall clip folders (``fall-NN-cam0-rgb``)
-        - 40 adl clip folders (``adl-NN-cam0-rgb``)
-        - 2 CSV files
+        - 30 fall clip folders (``fall-NN-cam0-rgb``) under
+          ``staged_root``
+        - 40 adl clip folders (``adl-NN-cam0-rgb``) under
+          ``staged_root``
+        - 2 CSV files under ``csv_label_root(csv_root)``
         - the marker
 
     The ``-rgb`` suffix is the real university layout: the
@@ -222,8 +240,9 @@ def expected_files(staged_root: Path) -> tuple[Path, ...]:
     builder's clip-id contract (``urfd-debug-fall-NN-cam0-rgb``).
     """
     files: list[Path] = [staged_root / STAGING_MARKER_FILENAME]
-    files.append(staged_root / "csvs" / FALL_CSV_FILENAME)
-    files.append(staged_root / "csvs" / ADL_CSV_FILENAME)
+    csv_dir = csv_label_root(csv_root)
+    files.append(csv_dir / FALL_CSV_FILENAME)
+    files.append(csv_dir / ADL_CSV_FILENAME)
     for seq in FALL_SEQUENCES:
         files.append(staged_root / f"fall-{seq:02d}-cam0-rgb")
     for seq in ADL_SEQUENCES:
@@ -231,15 +250,23 @@ def expected_files(staged_root: Path) -> tuple[Path, ...]:
     return tuple(files)
 
 
-def is_urfd_university_already_staged(staged_root: Path) -> bool:
+def is_urfd_university_already_staged(
+    staged_root: Path, csv_root: Path
+) -> bool:
     """True when the marker + every expected file is present.
 
     Re-runs of the staging script must short-circuit here — never
-    re-download a multi-GB dataset that is already on disk.
+    re-download a multi-GB dataset that is already on disk. The
+    check requires BOTH the frame staging root AND the persistent
+    CSV root: a frames-only tree or a CSVs-only tree is not
+    "fully staged" — the loader downstream needs both.
     """
     if not staged_root.is_dir():
         return False
-    for path in expected_files(staged_root):
+    csv_dir = csv_label_root(csv_root)
+    if not csv_dir.is_dir():
+        return False
+    for path in expected_files(staged_root, csv_root):
         if not path.exists():
             return False
     return True
@@ -413,6 +440,7 @@ def _enumerated_clips(staged_root: Path) -> tuple[StagedClipFolder, ...]:
 
 def stage_urfd_from_university(
     data_root: Path,
+    csv_root: Path,
     *,
     base_url: str = ALLOWED_UNIVERSITY_BASE_URL,
     force: bool = False,
@@ -421,14 +449,27 @@ def stage_urfd_from_university(
     """Stage URFD from the university repository.
 
     Args:
-        data_root: root under which to stage URFD. The path the
-            dataset lands at is the same shape as the Kaggle
-            mirror's: ``<data_root>/datasets/urfd/``.
+        data_root: root under which to stage URFD frames. The
+            path the frames land at is the same shape as the
+            Kaggle mirror's: ``<data_root>/datasets/urfd/``.
+            In LOCAL mode the notebook passes ``layout.dataset_root``
+            — a local-disk path. In DRIVE mode the notebook can
+            pass the Drive root directly; the layout choice is
+            the caller's, not the function's.
+        csv_root: root under which the two label CSVs persist.
+            CSVs do NOT live next to the frames: they survive
+            ``Run All`` re-runs on Colab, so they belong on the
+            artefact root (Drive in LOCAL mode), not the local
+            frame staging root. The CSVs land at
+            ``csv_root / artifacts / urfd_labels / <filename>``.
         base_url: must equal the whitelisted
             :data:`ALLOWED_UNIVERSITY_BASE_URL`. Any other value
             raises.
         force: when ``True``, re-download even if a complete
-            staged tree exists.
+            staged tree exists. The idempotency check requires
+            BOTH the frame staging root AND the persistent CSV
+            root — a half-staged tree is still considered
+            incomplete.
         max_attempts: linear-retry count per download.
 
     Returns:
@@ -444,12 +485,14 @@ def stage_urfd_from_university(
 
     staged_root = Path(data_root) / "datasets" / "urfd"
 
-    if not force and is_urfd_university_already_staged(staged_root):
+    if not force and is_urfd_university_already_staged(
+        staged_root, csv_root
+    ):
         enumerated = _enumerated_clips(staged_root)
         return UrfdUniversityStagingResult(
             staged_root=staged_root,
             clip_folders=enumerated,
-            csv_paths=_discover_csvs(staged_root),
+            csv_paths=_discover_csvs_at(csv_root),
             succeeded_clips=tuple(f.folder_name for f in enumerated),
             failed_clips={},
             already_staged=True,
@@ -457,10 +500,14 @@ def stage_urfd_from_university(
         )
 
     # Idempotency: clear a half-staged tree before re-downloading so
-    # a previous interrupted run doesn't leave a confusing mix.
+    # a previous interrupted run doesn't leave a confusing mix. We
+    # also clear a half-staged CSV root for the same reason.
     if staged_root.exists():
         shutil.rmtree(staged_root)
     staged_root.mkdir(parents=True, exist_ok=True)
+    csv_dir = csv_label_root(csv_root)
+    if csv_dir.exists():
+        shutil.rmtree(csv_dir)
 
     succeeded: list[str] = []
     failed: dict[str, str] = {}
@@ -479,8 +526,12 @@ def stage_urfd_from_university(
                 f"{type(exc).__name__}: {exc}"
             )
 
-    # CSVs to a persistent path under the staged root.
-    csv_destination = staged_root / "csvs"
+    # CSVs to a persistent path UNDER ``csv_root`` — NOT under
+    # the local frame staging root. Frames are local; labels
+    # persist on Drive so a fresh ``Run All`` does not re-download
+    # them. Both staging roots are independent and the
+    # idempotency check verifies both.
+    csv_destination = csv_dir
     csv_destination.mkdir(parents=True, exist_ok=True)
     for filename, url in build_csv_urls(base_url).items():
         destination = csv_destination / filename
@@ -504,8 +555,8 @@ def stage_urfd_from_university(
         raise RuntimeError(
             f"URFD university staging failed — {len(failed)} file(s) "
             "did not land. Inspect the partial tree at "
-            f"{staged_root} and re-run with force=True after fixing "
-            "the network or source.\n"
+            f"{staged_root} (frames) and {csv_dir} (labels) and re-run "
+            "with force=True after fixing the network or source.\n"
             f"{details}"
         )
 
@@ -513,7 +564,8 @@ def stage_urfd_from_university(
         f"staged_from={base_url}\n"
         "frame_zip_count=70\n"
         f"fall_zip_count={len(FALL_SEQUENCES)}\n"
-        f"adl_zip_count={len(ADL_SEQUENCES)}\n",
+        f"adl_zip_count={len(ADL_SEQUENCES)}\n"
+        f"csv_root={csv_root}\n",
         encoding="utf-8",
     )
 
@@ -521,24 +573,6 @@ def stage_urfd_from_university(
     return UrfdUniversityStagingResult(
         staged_root=staged_root,
         clip_folders=enumerated,
-        csv_paths=csv_paths,
-        succeeded_clips=tuple(succeeded),
-        failed_clips={},
-        already_staged=False,
-        source_base_url=base_url,
-    )
-
-    (staged_root / STAGING_MARKER_FILENAME).write_text(
-        f"staged_from={base_url}\n"
-        "frame_zip_count=70\n"
-        f"fall_zip_count={len(FALL_SEQUENCES)}\n"
-        f"adl_zip_count={len(ADL_SEQUENCES)}\n",
-        encoding="utf-8",
-    )
-
-    return UrfdUniversityStagingResult(
-        staged_root=staged_root,
-        clip_folders=_enumerated_clips(staged_root),
         csv_paths=csv_paths,
         succeeded_clips=tuple(succeeded),
         failed_clips={},
@@ -566,9 +600,15 @@ def _url_to_clip_folder_name(url: str) -> str:
     return name
 
 
-def _discover_csvs(staged_root: Path) -> dict[str, Path]:
-    """Return the on-disk CSV paths the script persists, or empty."""
-    csv_dir = staged_root / "csvs"
+def _discover_csvs_at(csv_root: Path) -> dict[str, Path]:
+    """Return the on-disk CSV paths the script persists, or empty.
+
+    The CSVs live under ``csv_label_root(csv_root)`` (i.e.
+    ``<csv_root>/artifacts/urfd_labels/``) — NOT under the frame
+    staging root. The function does not assume a particular
+    layout other than that contract.
+    """
+    csv_dir = csv_label_root(csv_root)
     out: dict[str, Path] = {}
     if not csv_dir.is_dir():
         return out
@@ -581,6 +621,7 @@ def _discover_csvs(staged_root: Path) -> dict[str, Path]:
 __all__: tuple[str, ...] = (
     "ALLOWED_UNIVERSITY_BASE_URL",
     "ADL_CSV_FILENAME",
+    "DEFAULT_CSV_LABEL_SUBDIR",
     "ADL_SEQUENCES",
     "CAMERA_SUFFIX",
     "FALL_CSV_FILENAME",

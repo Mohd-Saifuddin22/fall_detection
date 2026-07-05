@@ -92,9 +92,16 @@ class WhitelistTests(unittest.TestCase):
             build_frame_zip_urls(ALLOWED_UNIVERSITY_BASE_URL + "v2/")
 
     def test_stage_function_rejects_non_whitelisted_base_url(self) -> None:
+        # The base-URL whitelist check is the FIRST thing the
+        # stage function does, so we can pass any csv_root path
+        # here — the function raises before it touches the path
+        # argument. We use ``Path("/tmp/nonexistent")`` so the
+        # test does not depend on the filesystem.
         with self.assertRaises(RuntimeError):
             stage_urfd_from_university(
-                Path("/tmp/nonexistent"), base_url="https://evil.example/urfd/",
+                Path("/tmp/nonexistent"),
+                Path("/tmp/nonexistent_csv"),
+                base_url="https://evil.example/urfd/",
             )
 
 
@@ -150,9 +157,13 @@ class IdempotencyTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = Path(sys.modules["tempfile"].mkdtemp())
         self.addCleanup(_rm_tree, self._tmp)
+        # Persistent CSV root is independent of the frame staging
+        # root. Tests that need to verify the persistence contract
+        # create their own ``self._csv_root`` here too.
+        self._csv_root = self._tmp / "csv_persistent"
 
     def test_empty_dir_is_not_staged(self) -> None:
-        self.assertFalse(is_urfd_university_already_staged(self._tmp / "urfd"))
+        self.assertFalse(is_urfd_university_already_staged(self._tmp / "urfd", self._csv_root))
 
     def test_marker_alone_is_not_staged(self) -> None:
         staged = self._tmp / "urfd"
@@ -160,7 +171,7 @@ class IdempotencyTests(unittest.TestCase):
         (staged / STAGING_MARKER_FILENAME).write_text("staged\n", encoding="utf-8")
         # Marker alone — the script requires the marker AND every
         # expected file. A half-staged tree must not pass.
-        self.assertFalse(is_urfd_university_already_staged(staged))
+        self.assertFalse(is_urfd_university_already_staged(staged, self._csv_root))
 
     def test_marker_plus_real_folder_is_staged(self) -> None:
         staged = self._tmp / "urfd"
@@ -170,14 +181,15 @@ class IdempotencyTests(unittest.TestCase):
         (staged / "adl-01-cam0").mkdir()
         # No CSVs yet — still not "fully staged" by the script's
         # own definition.
-        self.assertFalse(is_urfd_university_already_staged(staged))
+        self.assertFalse(is_urfd_university_already_staged(staged, self._csv_root))
 
     def test_full_marker_is_staged(self) -> None:
         staged = self._tmp / "urfd"
         staged.mkdir(parents=True)
         # Simulate the full set: marker + every expected folder +
-        # the two CSVs.
-        for path in expected_files(staged):
+        # the two CSVs (now under csv_label_root(csv_root), not
+        # the frame staging root).
+        for path in expected_files(staged, self._csv_root):
             path.parent.mkdir(parents=True, exist_ok=True)
             if path.name == STAGING_MARKER_FILENAME:
                 path.write_text("staged\n", encoding="utf-8")
@@ -185,7 +197,7 @@ class IdempotencyTests(unittest.TestCase):
                 path.write_bytes(b"csv-bytes\n")
             else:
                 path.mkdir()
-        self.assertTrue(is_urfd_university_already_staged(staged))
+        self.assertTrue(is_urfd_university_already_staged(staged, self._csv_root))
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +264,10 @@ class StageHappyPathTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = Path(sys.modules["tempfile"].mkdtemp())
         self.addCleanup(_rm_tree, self._tmp)
+        # Persistent CSV root is independent of the frame staging
+        # root. Tests that need to verify the persistence contract
+        # create their own ``self._csv_root`` here too.
+        self._csv_root = self._tmp / "csv_persistent"
 
     def _zip_bytes(self, n_frames: int = 4) -> bytes:
         """Build a single archive that mirrors the real university layout.
@@ -287,7 +303,7 @@ class StageHappyPathTests(unittest.TestCase):
 
     def test_happy_path_extracts_seventy_clips_and_two_csvs(self) -> None:
         with _fake_network_dispatch(frames=self._frames(), csvs=self._csvs()):
-            result = stage_urfd_from_university(self._tmp)
+            result = stage_urfd_from_university(self._tmp, csv_root=self._csv_root)
 
         # All 70 clips landed.
         self.assertEqual(len(result.succeeded_clips), 70)
@@ -295,7 +311,7 @@ class StageHappyPathTests(unittest.TestCase):
         self.assertEqual(result.failed_clips, {})
         # Marker is present → next run short-circuits.
         self.assertTrue(
-            is_urfd_university_already_staged(result.staged_root),
+            is_urfd_university_already_staged(result.staged_root, self._csv_root),
         )
         # CSVs landed in the persistent location.
         self.assertIn(FALL_CSV_FILENAME, result.csv_paths)
@@ -318,12 +334,12 @@ class StageHappyPathTests(unittest.TestCase):
 
     def test_idempotent_run_does_not_redownload(self) -> None:
         with _fake_network_dispatch(frames=self._frames(), csvs=self._csvs()):
-            first = stage_urfd_from_university(self._tmp)
+            first = stage_urfd_from_university(self._tmp, csv_root=self._csv_root)
         # Second call: marker is present, no new downloads should
         # happen. The patch's urlopen would raise on any URL it
         # sees, so reaching already_staged=True is the proof.
         with patch("data.stage_urfd_university.urlopen") as fake:
-            second = stage_urfd_from_university(self._tmp)
+            second = stage_urfd_from_university(self._tmp, csv_root=self._csv_root)
             fake.assert_not_called()
         self.assertTrue(second.already_staged)
         self.assertEqual(len(second.succeeded_clips), 70)
@@ -331,8 +347,8 @@ class StageHappyPathTests(unittest.TestCase):
     def test_force_flag_re_runs_full_download(self) -> None:
         # First call: marker is written, no further network.
         with _fake_network_dispatch(frames=self._frames(), csvs=self._csvs()):
-            first = stage_urfd_from_university(self._tmp)
-        self.assertTrue(is_urfd_university_already_staged(first.staged_root))
+            first = stage_urfd_from_university(self._tmp, csv_root=self._csv_root)
+        self.assertTrue(is_urfd_university_already_staged(first.staged_root, self._csv_root))
         # Second call with force=True: idempotency short-circuit
         # is bypassed, downloads happen again. The test stubs
         # ``_download_with_retry`` so we don't depend on the urlopen
@@ -346,7 +362,7 @@ class StageHappyPathTests(unittest.TestCase):
 
         with patch("data.stage_urfd_university._download_with_retry",
                    counting_download):
-            second = stage_urfd_from_university(self._tmp, force=True)
+            second = stage_urfd_from_university(self._tmp, csv_root=self._csv_root, force=True)
         # The fact that all 70 clips landed is the proof that the
         # second call ran the full download path. With the
         # idempotent fast path, the second call would have set
@@ -372,6 +388,10 @@ class ManifestCompatibilityTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = Path(sys.modules["tempfile"].mkdtemp())
         self.addCleanup(_rm_tree, self._tmp)
+        # Persistent CSV root is independent of the frame staging
+        # root. Tests that need to verify the persistence contract
+        # create their own ``self._csv_root`` here too.
+        self._csv_root = self._tmp / "csv_persistent"
 
     def _stage_with_synthetic_zip(self) -> None:
         """Stage one fall clip + one adl clip + both CSVs."""
@@ -401,7 +421,7 @@ class ManifestCompatibilityTests(unittest.TestCase):
                 b"seq,label\n1,no_fall\n",
         }
         with _fake_network_dispatch(frames=frames, csvs=csvs):
-            stage_urfd_from_university(self._tmp)
+            stage_urfd_from_university(self._tmp, csv_root=self._csv_root)
 
     def test_staged_folder_is_named_fall_NN_cam0_rgb(self) -> None:
         self._stage_with_synthetic_zip()
@@ -487,6 +507,10 @@ class CorruptZipFailureTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = Path(sys.modules["tempfile"].mkdtemp())
         self.addCleanup(_rm_tree, self._tmp)
+        # Persistent CSV root is independent of the frame staging
+        # root. Tests that need to verify the persistence contract
+        # create their own ``self._csv_root`` here too.
+        self._csv_root = self._tmp / "csv_persistent"
 
     def _zip_bytes(self, n_frames: int = 4) -> bytes:
         """Build a single archive that mirrors the real university layout.
@@ -523,7 +547,7 @@ class CorruptZipFailureTests(unittest.TestCase):
             },
         ):
             with self.assertRaises(RuntimeError) as ctx:
-                stage_urfd_from_university(self._tmp)
+                stage_urfd_from_university(self._tmp, csv_root=self._csv_root)
         # The error must name the corrupt URL so a reviewer can
         # see WHICH clip failed.
         self.assertIn(urls[0], str(ctx.exception))
@@ -547,7 +571,7 @@ class CorruptZipFailureTests(unittest.TestCase):
 
         with patch("data.stage_urfd_university.urlopen", fake_urlopen):
             with self.assertRaises(RuntimeError):
-                stage_urfd_from_university(self._tmp)
+                stage_urfd_from_university(self._tmp, csv_root=self._csv_root)
         # The marker must NOT be present — a half-staged tree
         # must not look "complete" to the next run.
         marker = self._tmp / "datasets" / "urfd" / STAGING_MARKER_FILENAME
@@ -566,7 +590,7 @@ class CorruptZipFailureTests(unittest.TestCase):
 
         with patch("data.stage_urfd_university.urlopen", fake_urlopen):
             with self.assertRaises(RuntimeError):
-                stage_urfd_from_university(self._tmp)
+                stage_urfd_from_university(self._tmp, csv_root=self._csv_root)
         # The destination folder for the first clip is NOT
         # created.
         clip_dest = self._tmp / "datasets" / "urfd" / "fall-01-cam0"
@@ -624,7 +648,7 @@ class StructuredResultTests(unittest.TestCase):
                 f"{ALLOWED_UNIVERSITY_BASE_URL}{ADL_CSV_FILENAME}": b"x",
             },
         ):
-            result = stage_urfd_from_university(Path(sys.modules["tempfile"].mkdtemp()))
+            result = stage_urfd_from_university(Path(sys.modules["tempfile"].mkdtemp()), csv_root=Path(sys.modules["tempfile"].mkdtemp()) / "csv_persist")
         self.assertIsInstance(result, UrfdUniversityStagingResult)
         self.assertTrue(result.staged_root.exists())
         self.assertEqual(result.source_base_url, ALLOWED_UNIVERSITY_BASE_URL)
@@ -661,6 +685,171 @@ def _rm_tree(path: Path) -> None:
             path.unlink()
         except OSError:
             pass
+
+
+class CSVPersistenceTests(unittest.TestCase):
+    """CSV staging root and frame staging root are independent.
+
+    CSVs persist on the artefact root (Drive) so a fresh
+    ``Run All`` on Colab keeps the labels without re-downloading
+    them. Frames live on a local fast disk. The two staging
+    paths must be independent paths in the on-disk tree — a
+    reviewer's mental model is "frames on local, labels on
+    Drive" — and a missing persistent CSV must surface in the
+    idempotency check so a re-run knows to re-download.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = Path(sys.modules["tempfile"].mkdtemp())
+        self.addCleanup(_rm_tree, self._tmp)
+        # Frame staging root and CSV persistence root are
+        # independent. The default CSV subdir is appended by
+        # ``csv_label_root``.
+        self._staged_root = self._tmp / "datasets" / "urfd"
+        self._csv_root = self._tmp / "artifacts_persist"
+        self._csv_dir = self._csv_root / "artifacts" / "urfd_labels"
+
+    def test_frame_staging_root_and_csv_root_are_distinct_paths(self) -> None:
+        # A reviewer must be able to point at "frames" and
+        # "labels" and have them be different on-disk locations.
+        self.assertNotEqual(
+            self._staged_root.resolve(),
+            self._csv_root.resolve(),
+        )
+        # The CSVs live at csv_label_root(csv_root) — i.e. under
+        # <csv_root>/artifacts/urfd_labels/, NOT inside the
+        # frame staging root.
+        self.assertTrue(
+            str(self._csv_dir).startswith(str(self._csv_root)),
+            msg=f"CSVs leaked out of csv_root: {self._csv_dir}",
+        )
+        self.assertFalse(
+            str(self._csv_dir).startswith(str(self._staged_root)),
+            msg=f"CSVs landed inside frame staging root: {self._csv_dir}",
+        )
+
+    def test_cvs_are_persisted_to_csv_root(self) -> None:
+        # Run a full staging; the structured result's csv_paths
+        # live under csv_label_root(csv_root), not under the
+        # frame staging root.
+        members = {f"frame_{i:05d}.png": b"png" for i in range(2)}
+        with _fake_network_dispatch(
+            frames={url: _make_dummy_zip(members) for url in build_frame_zip_urls()},
+            csvs={
+                f"{ALLOWED_UNIVERSITY_BASE_URL}{FALL_CSV_FILENAME}": b"x",
+                f"{ALLOWED_UNIVERSITY_BASE_URL}{ADL_CSV_FILENAME}": b"x",
+            },
+        ):
+            result = stage_urfd_from_university(
+                self._tmp, csv_root=self._csv_root,
+            )
+        # Both CSVs are reported in csv_paths.
+        self.assertIn(FALL_CSV_FILENAME, result.csv_paths)
+        self.assertIn(ADL_CSV_FILENAME, result.csv_paths)
+        # And the on-disk location of each CSV is the CSV
+        # persistence root, not the frame staging root.
+        for path in result.csv_paths.values():
+            self.assertTrue(
+                str(path).startswith(str(self._csv_dir)),
+                msg=f"CSV landed outside csv_dir: {path}",
+            )
+            self.assertFalse(
+                str(path).startswith(str(self._staged_root)),
+                msg=f"CSV landed inside frame staging root: {path}",
+            )
+            # The on-disk file actually exists.
+            self.assertTrue(path.is_file())
+
+    def test_idempotency_requires_both_frames_and_csvs(self) -> None:
+        # Build the full set under both staged_root AND csv_root:
+        # the idempotency check returns True.
+        for path in expected_files(self._staged_root, self._csv_root):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.name == STAGING_MARKER_FILENAME:
+                path.write_text("staged\n", encoding="utf-8")
+            elif path.suffix.lower() == ".csv":
+                path.write_bytes(b"csv-bytes\n")
+            else:
+                path.mkdir()
+        self.assertTrue(
+            is_urfd_university_already_staged(
+                self._staged_root, self._csv_root,
+            )
+        )
+
+    def test_missing_persistent_csv_blocks_already_staged(self) -> None:
+        # Mark every frame as staged but leave the persistent
+        # CSV root EMPTY. The idempotency check must return
+        # False: half-staged is half-staged.
+        self._staged_root.mkdir(parents=True)
+        (self._staged_root / STAGING_MARKER_FILENAME).write_text(
+            "staged\n", encoding="utf-8",
+        )
+        for seq in FALL_SEQUENCES:
+            (self._staged_root / f"fall-{seq:02d}-cam0-rgb").mkdir()
+        for seq in ADL_SEQUENCES:
+            (self._staged_root / f"adl-{seq:02d}-cam0-rgb").mkdir()
+        # The persistent CSV root does NOT exist.
+        self.assertFalse(
+            is_urfd_university_already_staged(
+                self._staged_root, self._csv_root,
+            )
+        )
+
+    def test_missing_frames_block_already_staged(self) -> None:
+        # Mirror case: persistent CSVs in place but missing
+        # frames. Also not staged.
+        self._csv_dir.mkdir(parents=True)
+        (self._csv_dir / FALL_CSV_FILENAME).write_bytes(b"x")
+        (self._csv_dir / ADL_CSV_FILENAME).write_bytes(b"x")
+        # Frame root is empty.
+        self._staged_root.mkdir(parents=True)
+        (self._staged_root / STAGING_MARKER_FILENAME).write_text(
+            "staged\n", encoding="utf-8",
+        )
+        self.assertFalse(
+            is_urfd_university_already_staged(
+                self._staged_root, self._csv_root,
+            )
+        )
+
+    def test_force_re_runs_when_csv_root_missing(self) -> None:
+        # A previous run left frames but no persistent CSVs.
+        # The next call with force=False sees the half-staged
+        # state and triggers a fresh full re-download — the
+        # marker is rewritten and the CSVs land in csv_root.
+        self._staged_root.mkdir(parents=True)
+        (self._staged_root / STAGING_MARKER_FILENAME).write_text(
+            "stale\n", encoding="utf-8",
+        )
+        # Frames but no CSVs.
+        for seq in FALL_SEQUENCES:
+            (self._staged_root / f"fall-{seq:02d}-cam0-rgb").mkdir()
+        members = {f"frame_{i:05d}.png": b"png" for i in range(2)}
+        with _fake_network_dispatch(
+            frames={url: _make_dummy_zip(members) for url in build_frame_zip_urls()},
+            csvs={
+                f"{ALLOWED_UNIVERSITY_BASE_URL}{FALL_CSV_FILENAME}": b"y",
+                f"{ALLOWED_UNIVERSITY_BASE_URL}{ADL_CSV_FILENAME}": b"y",
+            },
+        ):
+            result = stage_urfd_from_university(
+                self._tmp, csv_root=self._csv_root,
+            )
+        # The half-staged marker was cleared + re-written by the
+        # stage call (the new content has a fresh staged_from=).
+        marker_text = (self._staged_root / STAGING_MARKER_FILENAME).read_text()
+        self.assertIn("staged_from=", marker_text)
+        # CSVs are now in csv_label_root(csv_root).
+        self.assertTrue(
+            (self._csv_dir / FALL_CSV_FILENAME).is_file()
+        )
+        self.assertTrue(
+            (self._csv_dir / ADL_CSV_FILENAME).is_file()
+        )
+        # The result reports success.
+        self.assertFalse(result.already_staged)
+        self.assertEqual(len(result.failed_clips), 0)
 
 
 if __name__ == "__main__":

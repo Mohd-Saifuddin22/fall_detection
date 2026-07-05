@@ -3529,6 +3529,143 @@ change is: it's no longer a hard gate inside `label_window`.
 
 ---
 
+## Issue 005 Step 5 — finalise the university switch-over
+
+The Issue 005 university source is now the project's
+authoritative default. The Kaggle mirror remains in place as
+a back-up but is no longer wired into the notebook. This step
+finalises the on-disk contract and the notebook wiring.
+
+### CSV persistence fix
+
+`data/stage_urfd_university.py` was writing CSVs to the local
+frame staging root (`<data_root>/datasets/urfd/csvs/`). On
+Colab in LOCAL mode that meant the labels lived on the local
+disk and were lost on a fresh `Run All`. The fix separates the
+two staging roots:
+
+- `stage_urfd_from_university(data_root, csv_root, *, ...)` —
+  frames land under `<data_root>/datasets/urfd/`, CSVs land
+  under `<csv_root>/artifacts/urfd_labels/`.
+- `is_urfd_university_already_staged(staged_root, csv_root)`
+  requires BOTH roots to be fully populated. A half-staged
+  tree (frames but no labels, or vice versa) does NOT pass.
+- `_discover_csvs_at(csv_root)` returns the on-disk CSV paths
+  under the new persistent location.
+- `expected_files(staged_root, csv_root)` enumerates the
+  full set of files the marker requires for "fully staged".
+- The marker now also records `csv_root=` for traceability.
+
+The brief's recommended CSV location is
+`<csv_root>/artifacts/urfd_labels/{urfall-cam0-falls.csv,
+urfall-cam0-adls.csv}`. The notebook passes
+`csv_root=layout.artifact_root` so the labels persist on
+Drive (the artefact root in LOCAL mode).
+
+### Notebook switch-over
+
+`colab/000_full_pipeline.ipynb` was updated:
+
+- `## 4. Load Kaggle credentials from Colab Secrets` is
+  replaced with `## 4. Stage URFD from the authoritative
+  university source`. The heading no longer mentions Kaggle.
+- The Kaggle-creds code (formerly cell 10) is replaced with
+  the university stager call:
+  `stage_urfd_from_university(layout.root,
+  csv_root=layout.artifact_root)`. The new cell uses the same
+  `if not CROPS_ALREADY_BUILT:` gate, with an `else:` branch
+  that prints a skip message.
+- `## 5. Stage URFD from Kaggle into Drive` is replaced with
+  `## 5. URFD now comes from the university source`. The
+  heading describes the sparse-real-ADL layout and the
+  independent idempotency check.
+- The Kaggle stager (formerly cell 12) is replaced with a
+  no-op + skip branch — the real staging call is in cell 10.
+- Manifest, perception, and cropping cells are unchanged.
+
+The Kaggle mirror `data/stage_urfd.py` is preserved as
+`stage_urfd_from_kaggle` for any future step that needs a
+back-up source.
+
+### Recompute / stale-shard clearing
+
+When `FORCE_RECOMPUTE=True` and the heavy upstream build is
+about to run, the crop cell now clears `CROPS_ROOT` BEFORE
+`run_cropping`. This prevents old 21-clip Kaggle-derived
+shards from lingering when rebuilding the 70-clip university
+source. The new code:
+
+```python
+if not CROPS_ALREADY_BUILT:
+    if FORCE_RECOMPUTE:
+        if CROPS_ROOT.exists():
+            shutil.rmtree(CROPS_ROOT)
+    # ... run_cropping ...
+```
+
+When `FORCE_RECOMPUTE=False`, the existing `is_urfd_university_already_staged(...)` short-circuit fires before `run_cropping`, and
+the old shards are reused untouched.
+
+### Labeling-alignment smoke cell
+
+A new pair of cells (`## 11a. URFD CSV / crop-window labeling
+alignment` + code) sits between the round-trip verification
+(`## 11`) and the Pipeline A smoke check (`## 12`). The cell:
+
+- Parses both CSVs from `layout.artifact_root / "artifacts"
+  / "urfd_labels"`.
+- Reads the first 3 windows (offsets 0, 1, 2) of `fall-01-cam0-rgb`
+  and `adl-01-cam0-rgb` from the available shards.
+- Calls `label_window(...)` on each window's frame indices
+  and prints `(clip_key, frame range, window_label, is_confuser)`.
+- Expected pattern: pre-fall windows in `fall-01` →
+  `no_fall`; windows spanning the falling onset (frame 83+)
+  or the lying tail (frame 113+) → `fall`. ADL windows →
+  `no_fall` (with `is_confuser` flipping only on label-1 frames).
+
+The cell is smoke-only: it does NOT bake labels into shards,
+does NOT train VideoMAE, and does NOT compute model metrics.
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `data/stage_urfd_university.py` | `stage_urfd_from_university` now takes a required `csv_root: Path` parameter. CSVs land at `csv_label_root(csv_root) = csv_root / "artifacts" / "urfd_labels" /`. `is_urfd_university_already_staged` and `expected_files` now take both roots. Marker records `csv_root=`. Removed the duplicate return block from the previous edit. |
+| `tests/test_stage_urfd_university.py` | Added `CSVPersistenceTests` (6 tests): frame staging root vs CSV root are distinct paths, CSVs persist to `csv_root`, idempotency requires BOTH roots, missing persistent CSV blocks "already staged", missing frames block it too, `force=False` re-runs when CSV root is missing. Updated all existing call sites to pass the new `csv_root` parameter. |
+| `colab/000_full_pipeline.ipynb` | Cells 9–12 (Kaggle-creds heading + code, Stage URFD heading + code) replaced with the university switch-over. Cell 22 (crop generation) prepends the `FORCE_RECOMPUTE` cleanup. Cells 25–26 are the new labeling-alignment smoke (heading + code). Markdown cell 0 (top-level) updated to no longer mention Kaggle. |
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 667 tests in 17.7s — OK    # 661 prior + 6 new for CSV persistence
+
+$ python -X utf8 -c "<AST-parse every code cell>"
+Total cells with syntax errors: 0
+
+$ python scripts/verify_notebook.py colab/000_full_pipeline.ipynb
+Local imports   : OK (0 error(s))
+Status          : OK — notebook is ready for Colab
+```
+
+`Status: OK` after the AST parse is clean. The only pyflakes
+warnings are the documented `from google.colab import drive`
+non-Colab-host noise (cell 2) and the cross-cell `undefined
+name` warnings on the smoke-check / Pipeline A cells (cells
+4 and 28). The verifier explicitly classifies the
+cross-cell warnings as expected.
+
+### Process note
+
+This step used five throwaway edit scripts during development
+to apply the multi-cell edits incrementally. They are NOT
+committed — `ls scripts/` returns only `verify_notebook.py`
+(plus the auto-generated `__pycache__`). All future notebook
+edits go through the established notebook-verifier AST check
+before reporting success.
+
+---
+
 ## File layout (after Issue 002)
 
 ```
