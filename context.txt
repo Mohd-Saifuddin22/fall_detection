@@ -3171,6 +3171,128 @@ manifest clip id in sync with the on-disk folder.
 
 ---
 
+## URFD university CSV label parser — Step 2
+
+The Issue 005+ pipeline consumes the two authoritative
+university URFD cam0 label files:
+
+- `urfall-cam0-falls.csv` — per-frame labels for fall-01..fall-30.
+- `urfall-cam0-adls.csv` — per-frame labels for adl-01..adl-40.
+
+The parser produces a validated, ready-to-query lookup. The
+loader can call `is_contiguous(sequence)` before training a
+window on a sequence to confirm every frame is labelled —
+catching half-staged trees before the label silently mismatches
+the frame index.
+
+### CSV format (verified)
+
+```
+<sequence>,<frame_number>,<label>,<col4>,<col5>,...,<col11>
+```
+
+- **No header.**
+- **11 columns**; the parser uses only the first 3.
+- Column 1: ``sequence`` — e.g. ``"fall-01"`` / ``"adl-01"``.
+- Column 2: ``frame_number`` — 1-based integer (the clip's
+  intra-clip frame index, NOT a global video timestamp).
+- Column 3: ``label`` — one of ``{-1, 0, 1}``.
+- Columns 4..11: ignored. The real university CSVs carry
+  per-frame bounding-box / sub-class metadata that the project
+  does not consume.
+
+### Label meanings
+
+| Value | Meaning | Use case |
+|---|---|---|
+| ``-1`` | Upright | No fall in progress. Default state of every adl clip and the pre-fall / post-fall regions of every fall clip. |
+| ``0`` | Falling / transition | The fall is happening — the subject is mid-air / mid-fall. |
+| ``1`` | Lying on the ground | The fall has completed; the subject is on the floor. |
+
+`VALID_LABELS = frozenset({-1, 0, 1})`. `LABEL_MEANINGS` is the
+public run-summary string for each value.
+
+### Frame-number alignment assumption
+
+The brief says: frame numbers are 1-based integers. The
+parser enforces this — non-positive frame numbers raise
+`MalformedURFDLabelRow`. The contiguity check
+`is_contiguous(sequence)` is the load-bearing alignment
+guarantee: it returns `True` iff the parsed frames form a
+contiguous 1..N run, no gaps. A clip whose CSV has frame 5
+missing surfaces as `is_contiguous("fall-01") == False`
+**before** the loader builds a training example on it.
+
+### Failure modes
+
+Every malformed row raises `MalformedURFDLabelRow` (a
+`ValueError` subclass) with a message that includes the source
+path and the line number:
+
+- Fewer than 3 comma-separated columns.
+- Empty sequence.
+- Non-integer frame number.
+- Non-positive frame number (`<= 0`).
+- Non-integer label.
+- Label outside `{-1, 0, 1}`.
+- Duplicate frame number within the same sequence.
+
+Blank lines and lines containing only whitespace are skipped
+(not malformed). The first 3 columns of every other non-empty
+line are validated.
+
+### Files created
+
+| Path | Purpose |
+|---|---|
+| `data/urfd_labels.py` | `FrameLabel`, `CSVLabels`, `parse_urfd_csv_label_text`, `parse_urfd_csv_label_file`, `MalformedURFDLabelRow`, `VALID_LABELS`, `LABEL_MEANINGS`. |
+| `tests/test_urfd_labels.py` | 26 unit tests: small-fixture happy path, mixed fall+adl sequence, real-archive 160-row alignment anchor, every malformed-row type, contiguity predicate, container shape. |
+
+### Public API contract
+
+```python
+parsed = parse_urfd_csv_label_file(
+    Path("urfall-cam0-falls.csv"),
+)
+# or
+parsed = parse_urfd_csv_label_text(text, source_label="...")
+
+# Structured lookup
+parsed.lookup(sequence, frame_number)         # int label or None
+parsed.frame_count(sequence)                  # int
+parsed.frame_range(sequence)                  # (min, max) inclusive
+parsed.is_contiguous(sequence)                # True iff 1..N with no gaps
+parsed.sequences()                            # tuple[str, ...] sorted
+```
+
+The :class:`FrameLabel` and :class:`CSVLabels` dataclasses
+validate at construction time — a hand-built invalid record
+is rejected the same way a malformed CSV row would be.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 630 tests in 19.5s — OK    # 604 prior + 26 new for the label parser
+
+$ python scripts/verify_notebook.py colab/000_full_pipeline.ipynb
+Local imports   : OK (0 error(s))
+Status          : OK — notebook is ready for Colab
+```
+
+The 160-row fixture (`test_real_archive_anchor`) pins the
+parser to the verified real `fall-01-cam0-rgb.zip` frame
+count: 160 frames, range 1..160 inclusive, contiguous. A
+future regression that, e.g., started counting from 0 would
+trip the contiguity check.
+
+Window labeling (combining the label lookups with the
+Pipeline A clip loader to emit per-frame targets) is **not**
+in this step — that lands as a follow-up that consumes
+`CSVLabels.lookup(...)` directly.
+
+---
+
 ## File layout (after Issue 002)
 
 ```
