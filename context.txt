@@ -7,27 +7,237 @@
 
 ## Current project state
 
-Phase I (Data Collecting & Processing) — Issue 001 foundation in place
-+ Issue 002 perception front-end in place + Issue 003 crop clip
-generator in place + Issue 004 Step 1 (eval harness foundation) in place.
+**Issues 001–005 are complete.** Data foundation is complete
+and switched from the Kaggle mirror to the authoritative
+University of Rzeszów URFD source. The full pipeline is wired
+end-to-end in `colab/000_full_pipeline.ipynb`.
 
-- Issue 001: Colab setup + role-locked dataset manifest (schema 1.1).
-- Issue 002: YOLO26 + ByteTrack perception front-end, fold-of-frames
-  input contract, URFD staging script (Kaggle → Drive, credential-safe),
-  URFD debug manifest builder, track-continuity / fragmentation report,
-  annotated-frame renderer. Issue 002 close-out items landed.
-- Issue 003: deterministic crop clip generator consuming Issue 002
-  tracking artefacts, producing WebDataset-style .tar shards of
-  fixed-length person crops on Drive.
-- Issue 004: eval-harness foundation (Step 1) + classification
-  metrics + slice-based reporting (Step 2) + detector-of-the-
-  detector self-test (Step 3) + event-level metrics + component-
-  metric scaffold (Step 4) + Le2i annotation parser (Step 5);
-  Issue 005 Step 1 = VideoMAE-ready crop-shard loader.
-  Step 1 ships the Pipeline A data-prep layer; classifier
-  head + training land in subsequent Issue 005 steps.
+- **Current HEAD:** `8188142`
+- **Verification:** 667 tests pass.
+- **Next issue:** Issue 006 VideoMAE.
 
-Blockers for downstream issues:
+### Status at a glance
+
+| Issue | Component | Status |
+| --- | --- | --- |
+| 001 | Colab setup + role-locked manifest (schema 1.1) | Done |
+| 002 | YOLO26 + ByteTrack perception front-end | Done |
+| 003 | Deterministic crop shard generator (32 × 224 × 224) | Done |
+| 004 | Eval harness foundation + classification + slice + self-test + event + scaffold + Le2i adapter | Done |
+| 005 | University URFD source + CSV label parser + window labelling + Pipeline A loader + notebook smoke check | Done |
+| 006 | VideoMAE fine-tune (Pipeline A classifier) | **Next** |
+
+### University switch-over (Issue 005)
+
+The Kaggle mirror was only a 21-clip subset with collision
+artifacts (`fall-01-cam0 (1)`, `adl-07-cam0 (1)`, …) and
+**no per-frame labels**. The University of Rzeszów page
+(`https://fenix.ur.edu.pl/~mkepski/ds/data/`) is the new
+authoritative source and gives the full 70 cam0 clips
+(30 fall + 40 ADL) plus per-frame label CSVs.
+
+| Path | Role |
+| --- | --- |
+| `data/stage_urfd.py` | Kaggle stager — **backup only**, no longer the default |
+| `data/stage_urfd_university.py` | University stager — **the default** |
+| `data/urfd_labels.py` | CSV label parser + `label_window` + `WINDOW_LABEL_UNLABELED` |
+
+**`data/stage_urfd_university.py` contract:**
+- Downloads 70 `<seq>-cam0-rgb.zip` files.
+- Downloads `urfall-cam0-falls.csv` and `urfall-cam0-adls.csv`.
+- Whitelisted base URL: `https://fenix.ur.edu.pl/~mkepski/ds/data/`
+  (strict equality + scheme-strict; any other host fails loud
+  before download).
+- Frames stage to local `dataset_root/datasets/urfd/`.
+- CSVs persist to `artifact_root/artifacts/urfd_labels/`
+  (the CSV root is independent of the frame staging root).
+
+**`data/urfd_labels.py` contract:**
+- Parses the 11-column CSV with first 3 cols (sequence,
+  frame_number, label).
+- `label_window(clip_id, frame_indices, csv)` returns
+  `(window_label, is_confuser)` — see Critical gotchas below.
+- The default rule is pluggable: Issue 006 can subclass
+  `WindowLabelingRule` and swap it.
+
+**`colab/000_full_pipeline.ipynb` now:**
+- Stages URFD from the university source (no Kaggle secrets).
+- Clears `artifacts/crops/` on `FORCE_RECOMPUTE=True` so stale
+  Kaggle shards don't linger.
+- Includes a §11a labeling-alignment smoke cell that
+  labels real crop windows from the cached shards using the
+  parsed CSVs.
+
+### Recent commit chain
+
+- `01c740a` — university stager
+- `1f36176` — CSV parser
+- `7f2629d` — labelling
+- `3825df7` — notebook wiring
+- `bbfa612` — `shutil` fix
+- `8188142` — `frame_index_offset` fix
+
+---
+
+## Critical gotchas for Issue 006 and beyond
+
+### Crop frame_index is 0-based; URFD CSV is 1-based
+
+**This is the single most important gotcha.** Source:
+`perception/frames.py` enumerates frames 0-based; the tracker
+inherits that index. The crop metadata sidecar persists
+`"frame_index": <0-based-absolute>` and the `TrackWindow`
+carries the same 0-based values.
+
+The URFD CSV is 1-based: `frame_number` starts at 1.
+
+When joining crop windows to CSV labels, pass
+`frame_index_offset=1` to `label_window(...)`. The
+`frame_index_offset` parameter exists exactly for this
+contract; it is documented on the function signature.
+
+**Issue 006 depends on this.** A wrong offset turns a
+near-perfect classifier into a random one with no obvious
+failure mode in unit tests.
+
+### CSV coverage is uneven — handle sparse labels
+
+**Fall clips are dense / contiguous.** `fall-01` has
+labels 1..160, all present, all in the CSV.
+
+**ADL clips are sparse.** `adl-01` has labels 6..150 with
+**frame 7 missing** (an annotator skipped it). The RGB is
+dense (1..160) but the CSV is not. Some RGB frames have
+no corresponding CSV label row.
+
+`label_window(...)` SKIPS missing frames. A window with
+zero available labels returns:
+- **`WINDOW_LABEL_UNLABELED`** for fall clips (so Issue 006
+  can deterministically drop the example).
+- **`(no_fall, False)`** for ADL clips (zero labels is still
+  no_fall by source-clip type).
+
+**Do not loosen `gap_tolerance` preemptively.** Only loosen
+later if Issue 006 eval proves data starvation.
+
+### CSV label meanings
+
+| Value | Meaning |
+| --- | --- |
+| `-1` | upright (no fall in progress) |
+| `0` | falling / transition |
+| `1` | lying on the ground |
+
+### Default window rule (Issue 005 default — pluggable)
+
+| Clip type | Rule |
+| --- | --- |
+| Fall | `fall` if any available label is `0` or `1`; else `no_fall` |
+| ADL | always `no_fall`; sets `is_confuser=True` if any available label is `1` |
+
+Rule is pluggable. Issue 006 can subclass `WindowLabelingRule`
+and pass it to `label_window(..., labeling_rule=my_rule)`.
+
+### Zip on-disk shape
+
+- `fall-NN-cam0-rgb.zip` (or `adl-NN-cam0-rgb.zip`) extracts to
+  a **double-nested** directory:
+  `<staged>/<seq>-cam0-rgb/<seq>-cam0-rgb/*.png`.
+- Frame files are `<seq>-cam0-rgb-NNN.png` (1-based, 3-digit
+  zero-padded, e.g. `fall-01-cam0-rgb-001.png`).
+- `clip_id` for `label_window(...)` is the manifest id
+  `urfd-debug-fall-NN-cam0-rgb` (the folder name, lowercased
+  for `build_clip_id`).
+
+### Clean rebuild rule (when state is wrong)
+
+Symptom of stale Kaggle data: 21 clips with `(1)`-suffixed
+ids. Steps:
+
+1. Restart runtime (clear `/content/fall_local`).
+2. Delete Drive `artifacts/crops/`.
+3. Delete Drive `artifacts/perception/`.
+4. `FORCE_RECOMPUTE = True` in the §1a config cell.
+5. Run All.
+
+A fresh full run downloads ~4 GB of university source.
+
+### LOCAL data mode
+
+- Frames are under `/content/fall_local` (wiped on restart).
+- Crops and CSVs persist on Drive — they survive `Run All`.
+- `frame_index_offset` is the only way to align 0-based
+  perception/crop frame_index with 1-based CSV `frame_number`.
+
+---
+
+## Current dataset state (verified by test runs)
+
+| Property | Value |
+| --- | --- |
+| Total clips | 70 (30 fall + 40 ADL) |
+| Shards on Drive | 70 |
+| Windows (default 32-frame stride) | 240 |
+| Fall windows | 41 |
+| No-fall windows | 199 |
+| Skipped (`too_many_gaps`) | 126 |
+| All fall clips have ≥1 fall window | yes |
+
+**Skipped-window note:** the 126 `too_many_gaps` skips come
+from cam0 detection weakness (perception fall-off) on the
+university source — `gap_tolerance` is held at the conservative
+default. Do not loosen `gap_tolerance` preemptively; only loosen
+after Issue 006 eval proves the data-starvation hypothesis.
+
+---
+
+## Issue 006 carry-forwards (VideoMAE)
+
+1. **Climb the ladder.** Pretrained VideoMAE → frozen or
+   partial backbone → full fine-tune only if justified by eval.
+2. **Handle class imbalance.** Only 41 fall windows. Use
+   weighted loss and/or oversampling.
+3. **Eval with recall and AUPRC**, never accuracy alone
+   (class imbalance breaks accuracy).
+4. **Train/validation split by clip/subject**, not by window
+   (window-level splits leak across consecutive frames of the
+   same fall).
+5. **Overfit a tiny slice first** to prove wiring before any
+   large run.
+6. **Crops are 32-frame; VideoMAE-base is commonly 16-frame.**
+   Issue 006 must reconcile by subsampling or using a
+   32-frame-capable variant.
+7. **Run fine-tuning on L4** (capability-detect fp16 / bf16
+   before training).
+8. **Checkpoint and resume** — Colab pre-emptions are common.
+
+**Note:** `issues/006-pipeline-a-videomae-classifier.md` has
+malformed/duplicated section structure and a contradiction
+between "fits in T4" and "Issue 015 reserves A100". Reconcile
+the doc before implementing Issue 006.
+
+---
+
+## Owed items (not blocking Issue 006)
+
+- **`data/stage_le2i.py`** before Issue 007. The Le2i
+  annotation parser exists; the staging script does not.
+- **Component perception metrics** before Issue 007: mAP,
+  IDF1, MOTA, HOTA.
+- **Subject-id hard gate** before trusting validation metrics.
+  Once subject ids are in the manifest, the evaluator must
+  reject any train/val split that mixes the same subject
+  across the two sets.
+- **Enhance `scripts/verify_notebook.py`**:
+  concatenate code cells in run order and run pyflakes over
+  the combined source. The current per-cell check missed
+  cross-cell undefined names (recent misses: `shutil`,
+  `FALL_CSV_FILENAME`). A run-order concatenation closes that
+  gap.
+
+---
+
+## Blockers for downstream issues
 - Issue 005 (Pipeline A data prep) and Issue 008 (Pipeline B data prep)
   are unblocked now — both consume the same source frames and the same
   manifest; only Issue 005 reads the Issue 003 shards.
