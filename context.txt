@@ -12,7 +12,7 @@ and switched from the Kaggle mirror to the authoritative
 University of Rzeszów URFD source. The full pipeline is wired
 end-to-end in `colab/000_full_pipeline.ipynb`.
 
-- **Current HEAD:** `b9578a2`
+- **Current HEAD:** `09b4a56`
 - **Verification:** 667 tests pass.
 - **Next issue:** Issue 006 VideoMAE.
 
@@ -3579,16 +3579,19 @@ Therefore real crop windows must be joined to CSV labels with
 `frame_index_offset=1`. The live notebook smoke
 (`000_full_pipeline.ipynb`) already does this.
 
-NOTE (open cleanup, specced to minimax): `label_window`'s
-default is still `frame_index_offset=0` and its docstring in
-`data/urfd_labels.py` still (wrongly) claims crops are 1-based.
-The default 0 is a mechanical "no shift" knob that the *unit
-tests* rely on (they feed synthetic 1-based lists), so the
-default must NOT be flipped — instead the false docstrings are
-being corrected and a correct-by-construction real-data entry
-point (offset baked in) is being added so 006 cannot forget the
-`+1`. Until that lands, EVERY real-crop call site must pass
-`frame_index_offset=1` explicitly.
+RESOLVED (commit 09b4a56): the false docstrings are corrected and
+a correct-by-construction real-crop entry point now exists.
+`data/urfd_labels.py` exports `CROP_TO_CSV_FRAME_OFFSET = 1` and
+`label_window_from_crop_meta(clip_id, crop_frame_indices, csv,
+*, labeling_rule=...)`, which applies the `+1` internally. **Every
+real-crop caller (Issue 006 training/eval, the notebook smoke)
+MUST use `label_window_from_crop_meta` — NOT the primitive
+`label_window`**, whose default `frame_index_offset=0` is a
+no-shift knob kept only for synthetic fixtures. A regression that
+drops the `+1` is caught by
+`test_wrapper_plus_one_is_load_bearing_at_fall_onset_boundary`
+(a 51..82 window that is `fall` only because the offset is
+applied). Suite: 678 pass.
 
 ### Guard behavior
 
