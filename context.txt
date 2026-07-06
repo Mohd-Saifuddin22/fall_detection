@@ -4167,3 +4167,321 @@ Stage-runner imports found: NONE    # perception.*, cropping.runner, data.stage_
 - [x] No remaining `torch.isfinite(...)` call on `initial_loss`, `final_loss`, or any other Python float.
 
 ---
+
+## Issue 006 Prompt #2 — frozen-backbone VideoMAE fine-tune
+
+This prompt stands up **rung-1** of Pipeline A: cached-feature extraction from a frozen Kinetics-finetuned VideoMAE backbone, followed by linear-head training on real validation. The backbone is **not** unfrozen at this prompt — that is the explicit scope guardrail.
+
+### Decisions
+
+1. **Primary model**: `MCG-NJU/videomae-base-finetuned-kinetics` (Kinetics pre-training signal that the frozen backbone carries). Plain `MCG-NJU/videomae-base` is kept only as an **ablation note** in §3 — not the main path.
+2. **Trustworthy model load**: the Kinetics-finetuned state dict is downloaded separately and every non-classifier key is asserted to match the loaded model exactly (shape + presence). Classifier head is allowed to differ because of `num_labels=2 + ignore_mismatched_sizes=True`; backbone mismatches fail loud. The model is pinned to the HF Hub id and the load path is recorded in the run log (`metrics/pipeline_a/006_pipeline_a_run_log.json`).
+3. **Stratified source-clip split**: clip_ids are partitioned by source family (`fall-*` vs `adl-*`), then each family is deterministically shuffled and split 70/15/15 at seed=42. The validation set is **asserted** to contain at least one fall-source window. True window-level fall / no_fall / unlabeled counts per split are reported using `label_window_from_crop_meta(...)` — NOT the source-clip label.
+4. **Validation baselines before any training**:
+   - **Majority-class all-no_fall** (every prediction = 0.0). AUPRC = positive rate (~0.17 on the current val set).
+   - **Frozen Kinetics + untrained binary head** (freshly-reinitialised 2-class head). AUPRC near 0.5.
+   Both are run through the SAME `compute_classification_metrics` harness the trained model uses — apples-to-apples comparison.
+5. **Rung-1 training as frozen-backbone feature extraction + linear head**:
+   - Backbone frozen (`requires_grad=False` on every non-classifier parameter).
+   - Features extracted by `model.video_mae(pixel_values=...)` in `eval()` + `no_grad()`. Output is `last_hidden_state[:, 0, :]` (the `[CLS]` token — the natural input to the original classifier head).
+   - AMP capability-detected: `bf16` on L4/A100 where supported, `fp16` on T4.
+   - Features cached in memory (~740 KB total — trivial).
+   - Peak GPU memory captured via `torch.cuda.max_memory_allocated()`.
+   - Fresh `nn.Linear(HIDDEN_SIZE, 2)` trained on cached features with **weighted cross-entropy** (inverse-frequency class weights on train window-level labels). AdamW, `lr=1e-3`, `weight_decay=1e-4`, manual loop, 30 epochs, batch size 16.
+   - **Do NOT reuse the §7 tiny-slice overfit model** — the §8 cell reloads the model fresh.
+6. **Checkpointing + resume**: every epoch whose `val_auprc > best_auprc` writes `<artifact_root>/checkpoints/pipeline_a/linear_head.pt` with `{epoch, head_state, optimizer_state, best_val_auprc, split_seed, class_weights, hidden_size, model_id, transformers_version, torch_version}`. On re-run, `_load_latest` reads the checkpoint and resumes from `start_epoch + 1`. The checkpoint lives under `artifacts/checkpoints/` which `.gitignore` already excludes.
+7. **Epoch selection: best val AUPRC only — never accuracy.** The selection key is `best_val_auprc` in the checkpoint.
+8. **Validation evaluation through the harness**:
+   - **Probabilities come from `softmax(logits)[:, 1]`** — NEVER raw logits, NEVER `argmax`.
+   - **Window-level** predictions + labels: `ClipPrediction(score=fall_score, ...)` + `ClipLabel(label=FALL/NO_FALL, ...)` per window.
+   - **Clip-level**: window scores aggregated by **max-pool** (`max(prob[fall])` across all windows of the same clip_id). Clip label is `fall` for `fall-*` and `no_fall` for `adl-*`.
+   - Both reports run through `evaluation.metrics.classification.compute_classification_metrics`.
+   - **Primary metrics: AUPRC + recall.** Accuracy, precision, specificity, F1, AUC-ROC, and the confusion matrix are reported alongside, clearly marked non-primary.
+9. **Versioned result JSON via `evaluation.result_persistence.MetricResultStore`**:
+   - `run_id="006_p2_kinetics_<ckpt_id>"` (e.g. `ep12_auprc0.6421`).
+   - `format_version="1.0"`.
+   - `metadata.notes` carries: transformers / torch versions, model + linear-head parameter counts, checkpoint path + size, split seed, class weights, AMP dtype, peak GPU memory, inference FPS, best val AUPRC, baseline summary.
+   - `metadata.context = ExecutionContext.EVALUATION` (denies frozen access by design).
+10. **FPS / latency / model size**: two paths recorded — linear head alone and full backbone + head. Plus model size (total / trainable / head params) and checkpoint byte size.
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `colab/006_pipeline_a_videomae.ipynb` | Upgraded to Prompt #2. New: §3 Kinetics model load + key-by-key backbone integrity check; §6 stratified split + per-split window-level label counts; §8 validation baselines (majority + untrained Kinetics); §9 frozen-backbone feature extraction + cache + peak GPU memory; §10 linear head training (weighted CE, AdamW, checkpoint/resume, best by val AUPRC); §11 validation evaluation (window + clip-level max-pool, FPS, model size, versioned result JSON via `MetricResultStore`). The §7 tiny-slice overfit cell is kept as a smoke test; its model is NOT reused for production training. |
+| `context.txt` | This section. |
+
+**No source code changed.** All production code is consumed unchanged from `data/manifests`, `data/urfd_labels`, `evaluation/*`, `pipeline_a/load_crops`, `cropping/shard_writer`, `colab/data_mode`, and `transformers`.
+
+### API / result contracts
+
+- **Output JSON** is at `<artifact_root>/metrics/pipeline_a/<run_id>/results.json` (loadable by `MetricResultStore.load(run_id)`). The run_id encodes the checkpoint's epoch + best val AUPRC.
+- **Checkpoint** is at `<artifact_root>/checkpoints/pipeline_a/linear_head.pt` and contains the keys listed in decision (6). NOT committed (`.gitignore` covers `artifacts/checkpoints/`).
+- **Model + feature cache** are not persisted. Features are re-extracted on every run (sub-second per epoch).
+
+### Assumptions
+
+1. Colab runtime has a CUDA GPU (T4 / L4 / A100). CPU-only runtimes fail loud in the env recording step.
+2. `huggingface_hub` and `safetensors` are installed (transitive deps of `transformers`); if not, the backbone integrity check fails loud with a clear message.
+3. The Kinetics-finetuned model id resolves from HF Hub on a fresh Colab runtime (cache is fine).
+4. The cached crop shards (70 shards / 240 windows) exist on Drive from `colab/000_full_pipeline.ipynb`. If missing, the §2 guard fails loud.
+5. The stratified split's per-family sample sizes are large enough that the 70/15/15 ratios produce at least one fall clip in val (asserted).
+
+### Open issues / not in this prompt
+
+- **Full fine-tune** (unfreeze backbone) + scheduler + LR warmup + early stopping. The ladder-climb gate per Issue 006 spec: only unfreeze if a documented eval failure justifies the extra cost.
+- **Class-imbalance handling** beyond inverse-frequency weights. The full 41-fall / 199-no-fall imbalance is not yet addressed by oversampling or focal loss; if Issue 007 results need it, that is a separate prompt.
+- **Frozen-unseen test** evaluation. `ExecutionContext.FINAL_JUDGEMENT` is the only context that may read the frozen vault; the 006 eval calls use `EVALUATION` which denies it. Issue 007 wires the frozen access.
+- **Pipeline C fusion / post-verification** (Issues 011–012).
+- **Real-time opt** (Issue 015): the full backbone+head FPS recorded here is the *baseline*; the unfreeze + onnx / TensorRT optimisation is a separate prompt.
+- **Planned-vs-trained comparison** for the ABLATION note (`MCG-NJU/videomae-base` without Kinetics pre-training). A separate ablation notebook.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 678 tests in 25.695s — OK    # no test removed
+
+$ python scripts/verify_notebook.py colab/006_pipeline_a_videomae.ipynb
+Local imports   : OK (0 error(s))
+Pyflakes        : passed (all clean)
+Status          : OK — notebook is ready for Colab
+
+$ cross-cell check (concatenate code cells, run pyflakes on combined source)
+AST parse on concatenated source: PASSED.
+Cross-cell undefined names             : 12 (expected — cells reference layout / CROPS_ROOT / CSV_LABEL_DIR /
+                                    METRICS_DIR / ckpt_id / BASELINE_RESULTS / val_feats_X etc. defined
+                                    in earlier cells; per-cell pyflakes already classifies them as expected.)
+
+$ stage-runner import audit
+Stage-runner imports found: NONE    # perception.*, cropping.runner, data.stage_urfd*, etc. all absent
+
+$ probabilities-source audit (softmax(logits)[:, 1])
+Cells using softmax for probabilities: [24]  (val eval cell)
+Cells using argmax for primary scoring: NONE
+Cells setting score from raw logits:    NONE    # no logits-as-score without softmax
+
+$ accuracy-as-primary audit
+Hits: 0 (one false positive: "Accuracy is intentionally NOT used for selection
+        or headline reporting" matched 'primary.*accuracy' as a substring — the code
+        explicitly says accuracy is NOT primary.)
+```
+
+### Prompt #2 acceptance checklist (closes the brief)
+
+- [x] Trustworthy model-load checks: pinned model id + backbone integrity key-by-key.
+- [x] Primary model = `MCG-NJU/videomae-base-finetuned-kinetics`; plain `videomae-base` only as ablation note.
+- [x] Stratified source-clip split (validation has fall support, asserted).
+- [x] Per-split true window-level fall/no-fall counts via `label_window_from_crop_meta(...)`.
+- [x] Validation baselines (majority + frozen Kinetics + untrained head) before training.
+- [x] Rung-1 training: frozen backbone → cached features → fresh linear head with weighted CE.
+- [x] AMP capability-detected (bf16 / fp16), peak GPU memory recorded, features cached in memory.
+- [x] Manual training loop with AdamW; §7 model not reused.
+- [x] Checkpointing + resume (head state, optimizer state, epoch, best val AUPRC, config, split seed).
+- [x] Epoch selection by val AUPRC only — never accuracy.
+- [x] Validation evaluation through `compute_classification_metrics`; window + clip-level (max-pool).
+- [x] Probabilities come from `softmax(logits)[:, 1]`; no argmax / no raw logits for scoring.
+- [x] Versioned result JSON via `evaluation.result_persistence.MetricResultStore`, tied to model id + pinned versions + seed + class weights + config.
+- [x] FPS / latency for feature extraction + linear head + full backbone; model size + checkpoint MB.
+- [x] Frozen unseen data closed: every eval uses `ExecutionContext.EVALUATION`.
+- [x] No committed weights / checkpoints / feature caches (`.gitignore` covers `artifacts/checkpoints/`).
+- [x] `python -m unittest discover tests` passes with no test removals.
+- [x] `python scripts/verify_notebook.py colab/006_pipeline_a_videomae.ipynb` reports OK.
+- [x] Cross-cell check on concatenated source: AST parse PASSED, cross-cell pyflakes issues are expected (per-cell pyflakes already classifies them as expected).
+- [x] No perception / cropping stage runners imported.
+- [x] Harness receives probabilities from `softmax(logits)[:, 1]`, not logits or argmax.
+- [x] Reporting / selection never uses accuracy as the primary criterion.
+
+---
+
+## Issue 006 Prompt #2 — bug-fix patch (transformers pin + backbone attr + pooling)
+
+Three blocking bugs in the Prompt #2 implementation were caught in a final review and fixed in-place. Scope is strictly limited to the three fixes + the low-risk bonus.
+
+### Fix 1 — Pin `transformers==4.46.3` exactly
+
+- `requirements.txt`: `transformers>=4.45.0` → `transformers==4.46.3` (the floating `>=` is gone).
+- `colab/setup.py:APPROVED_PIP_PACKAGES`: `"transformers"` → `"transformers==4.46.3"`. The Colab setup now installs the exact pinned version.
+- Notebook §3 (model-load cell, idx=8): `assert transformers.__version__ == "4.46.3"` is added right after the version print. If Colab silently drifts to a newer or older version, the notebook fails loud with a message pointing at `colab/000_full_pipeline.ipynb` for a re-install. The version is still recorded in the run log.
+- The backbone integrity check (key-by-key shape + presence vs the Kinetics-finetuned state dict) is **kept unchanged** — classifier-head keys are still allowed to differ; non-classifier keys must match exactly.
+
+### Fix 2 — Backbone attribute: `model.video_mae` → `model.videomae`
+
+`transformers==4.46.3` exposes the VideoMAE backbone under `model.videomae` (single attribute name, no `video_mae` alias). Every call site in the notebook was updated. Grep audit:
+
+```
+model.video_mae occurrences: 0
+model.videomae occurrences: 2  (one in §9 feature cache, one in §11 FPS path)
+```
+
+### Fix 3 — Feature pooling matches the actual classifier path
+
+VideoMAE has **no CLS token**. The original `.classifier` takes `last_hidden_state[:, 0, :]` because index 0 happens to be the first patch token (a temporal tubelet), not a learned class token. A fresh linear head trained on `last_hidden_state[:, 0, :]` is wired to the *wrong* representation.
+
+The pooling is now:
+
+```python
+out = model.videomae(pixel_values=pixel_values)
+hidden = out.last_hidden_state
+pooled = hidden.mean(dim=1)                       # mean-pool over all patch tokens
+if getattr(model, "fc_norm", None) is not None:   # BatchNorm before the head, if present
+    pooled = model.fc_norm(pooled)
+feat = pooled.float()
+```
+
+Applied to **both** the feature-cache path (§9) and the FPS / timing path (§11) so the two paths cannot drift. The comment that claimed a CLS token was removed.
+
+Grep audit:
+
+```
+last_hidden_state[:, 0 occurrences: 0
+[CLS] occurrences:                  0
+fc_norm occurrences:                5  (one comment, one getattr, one call, plus the §3 mention)
+```
+
+### Bonus (low-risk, optional) — checkpointing + AMP
+
+- **Save both `linear_head_best.pt` and `linear_head_latest.pt`** every epoch (not just best). The `latest` is for resume on crash; the `best` drives the metric for Issue 007. A new `_save_ckpt_to(path, ...)` helper makes the two paths explicit; `_save_ckpt(...)` is kept as a backward-compat wrapper that writes to the best path.
+- **AMP dtype selection**: prefer `fp16` on T4, keep `bf16` on L4/A100 where supported, fall back to `fp16` on older hardware. The previous logic took `bf16` whenever `torch.cuda.is_bf16_supported()` returned True, which on some T4 driver combinations silently downgrades to a slow bf16 path. The new selection uses the `gpu_name` recorded in §1a to break the tie.
+
+### Verification
+
+```
+$ grep "model.video_mae" colab/006_pipeline_a_videomae.ipynb
+(no matches)
+
+$ grep "last_hidden_state\[:, 0" colab/006_pipeline_a_videomae.ipynb
+(no matches)
+
+$ grep "transformers" requirements.txt
+transformers==4.46.3        # HuggingFace — VideoMAE, ViTPose backbones; pinned exactly (Issue 006 Prompt #2)
+
+$ grep "transformers" colab/setup.py
+"transformers==4.46.3",    # (inside APPROVED_PIP_PACKAGES)
+
+$ python -m unittest discover tests
+Ran 678 tests in 37.678s — OK    # no test removed
+
+$ python scripts/verify_notebook.py colab/006_pipeline_a_videomae.ipynb
+Local imports   : OK (0 error(s))
+Pyflakes        : passed (all clean)
+Status          : OK — notebook is ready for Colab
+
+$ python /tmp/cross_cell_check.py
+AST parse on concatenated source: PASSED.
+Cross-cell undefined names             : 12 (expected — cells reference layout / CROPS_ROOT / CSV_LABEL_DIR /
+                                    METRICS_DIR / ckpt_id / BASELINE_RESULTS / val_feats_X etc. defined
+                                    in earlier cells; per-cell pyflakes already classifies them as expected.)
+torch.isfinite-on-float audit: PASSED
+```
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `requirements.txt` | `transformers>=4.45.0` → `transformers==4.46.3` |
+| `colab/setup.py` | `APPROVED_PIP_PACKAGES` entry pinned to `transformers==4.46.3` |
+| `colab/006_pipeline_a_videomae.ipynb` | §3 added `assert transformers.__version__ == "4.46.3"`; §9 backbone attr + pooling + AMP T4-prefer; §11 backbone attr + pooling; §10 saves both best and latest checkpoints (low-risk bonus) |
+| `context.txt` | This section |
+
+**No source code changed** beyond the three fixes + the two bonus improvements. The backbone integrity check (key-by-key shape + presence vs the Kinetics-finetuned state dict) is preserved.
+
+### Bug-fix acceptance checklist (closes the brief)
+
+- [x] `transformers==4.46.3` pinned in `requirements.txt` (no floating `>=`).
+- [x] `transformers==4.46.3` pinned in `colab/setup.py:APPROVED_PIP_PACKAGES` so the Colab setup installs the exact version.
+- [x] `assert transformers.__version__ == "4.46.3"` in the notebook §3 model-load cell.
+- [x] Actual installed version recorded in the run log (`metrics/pipeline_a/006_pipeline_a_run_log.json`).
+- [x] Backbone integrity check kept (key-by-key; classifier allowed; no backbone missing/unexpected).
+- [x] Every `model.video_mae` replaced with `model.videomae` (grep: 0 remaining).
+- [x] Every `last_hidden_state[:, 0, :]` replaced with the mean+fc_norm pooling path.
+- [x] Same pooling in the feature-cache path (§9) and the FPS / timing path (§11).
+- [x] Comment claiming a CLS token removed.
+- [x] Grep audit: 0 `last_hidden_state[:, 0`, 0 `[CLS]`, 0 `model.video_mae`.
+- [x] Bonus: save both latest and best checkpoints; prefer fp16 on T4, bf16 on L4/A100.
+- [x] `python -m unittest discover tests` passes with no test removals.
+- [x] `python scripts/verify_notebook.py colab/006_pipeline_a_videomae.ipynb` reports OK.
+- [x] Cross-cell check on concatenated source: AST parse PASSED.
+
+---
+
+## Issue 006 Prompt #2 — §1 code-cell regression fix
+
+A previous edit accidentally replaced the §1 "Mount Drive + resolve layout" **code cell** with a **duplicate markdown title cell** (the Prompt #1 / Prompt #2 title). The §1 code cell that mounts Drive, resolves the layout via `colab.data_mode`, defines `CROPS_ROOT` / `CSV_LABEL_DIR` / `CKPT_DIR` / `METRICS_DIR`, and prints the resolved paths was missing. Without it, every downstream code cell that uses `layout`, `CROPS_ROOT`, `CSV_LABEL_DIR`, `CKPT_DIR`, or `METRICS_DIR` would NameError at runtime.
+
+### Fix
+
+Restored the §1 code cell at notebook index 2 (immediately after the `## 1. Mount Drive + resolve layout` markdown cell and before `## 1a. GPU / environment recording`). The cell:
+
+- Mounts Drive (skips on non-Colab hosts).
+- Resolves the layout via `colab.data_mode.resolve_data_layout`.
+- Defines `CROPS_ROOT`, `CSV_LABEL_DIR`, `CKPT_DIR`, `METRICS_DIR` from the layout.
+- Creates the artefact directories.
+- Prints the resolved paths.
+
+The cell type is `code`; the duplicate markdown title cell is **gone** (replaced, not duplicated — total cell count unchanged at 26).
+
+The previously-correct Prompt #2 fixes are **untouched**:
+- `transformers==4.46.3` pin in `requirements.txt` and `colab/setup.py:APPROVED_PIP_PACKAGES`.
+- `assert transformers.__version__ == "4.46.3"` in §3.
+- `model.videomae` (no `model.video_mae`).
+- mean-pool + optional `fc_norm` pooling in §9 and §11 (no `last_hidden_state[:, 0`).
+- best / latest checkpointing in §10.
+- fp16-on-T4 in §9.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 678 tests in 21.300s — OK    # no test removed
+
+$ python scripts/verify_notebook.py colab/006_pipeline_a_videomae.ipynb
+Local imports   : OK (0 error(s))
+Pyflakes        : passed (all clean)
+Status          : OK — notebook is ready for Colab
+
+$ cell order after the fix
+idx= 0 id=006-1      type=markdown  '# Issue 006 Prompt #1 — Pipeline A VideoMAE Scaffold'
+idx= 1 id=006-2      type=markdown  '## 1. Mount Drive + resolve layout'
+idx= 2 id=006-3      type=code      'import os, pathlib, sys'                    ← restored
+idx= 3 id=006-4      type=markdown  '## 1a. GPU / environment recording'
+idx= 4 id=006-5      type=code      'import json, platform, shutil, subprocess'
+
+$ python /tmp/cross_cell_check.py
+AST parse on concatenated source: PASSED.
+Cross-cell undefined names             : 0    # layout / CROPS_ROOT / CSV_LABEL_DIR / CKPT_DIR / METRICS_DIR
+                                              # are all defined in the §1 code cell and in scope for every
+                                              # downstream cell. The earlier 12 cross-cell undefineds are gone.
+pyflakes on concatenated source: PASSED.
+torch.isfinite-on-float audit: PASSED.
+
+$ grep audits
+model.video_mae occurrences:                  0
+last_hidden_state[:, 0 occurrences:           0
+transformers==4.46.3 in notebook:             True   (assert statement)
+model.videomae occurrences:                   2
+fc_norm occurrences:                          5
+
+$ requirements.txt
+transformers==4.46.3        # HuggingFace — VideoMAE, ViTPose backbones; pinned exactly (Issue 006 Prompt #2)
+```
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `colab/006_pipeline_a_videomae.ipynb` | Cell at index 2 (id `006-3`): cell_type `markdown` → `code`, source replaced with the §1 setup/layout code. No other cells touched. Total cell count unchanged at 26. |
+| `context.txt` | This section. |
+
+### Regression-fix acceptance checklist (closes the brief)
+
+- [x] The §1 "Mount Drive + resolve layout" code cell is restored.
+- [x] The duplicate markdown title cell is gone.
+- [x] Cell order: `## 1. Mount Drive + resolve layout` (md) → §1 code → `## 1a. GPU / environment recording` (md) → §1a code.
+- [x] `python -m unittest discover tests` passes with no test removals.
+- [x] `python scripts/verify_notebook.py colab/006_pipeline_a_videomae.ipynb` reports OK.
+- [x] Cross-cell check on concatenated source: AST parse PASSED, 0 cross-cell undefineds (`layout`, `CROPS_ROOT`, `CSV_LABEL_DIR`, `CKPT_DIR`, `METRICS_DIR` all in scope).
+- [x] Notebook still has 0 `model.video_mae` references and 0 `last_hidden_state[:, 0` occurrences.
+- [x] `requirements.txt` still contains `transformers==4.46.3`.
+
+---

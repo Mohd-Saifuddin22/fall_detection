@@ -84,7 +84,11 @@ class DriveLayout:
 # and reinstalling it risks pulling a CPU-only wheel.
 APPROVED_PIP_PACKAGES: tuple[str, ...] = (
     "ultralytics",
-    "transformers",
+    # Issue 006 Prompt #2 — pinned exactly. The Kinetics-finetuned
+    # VideoMAE backbone integrity check depends on a specific
+    # transformers implementation; a silent upgrade risks an
+    # incompatible shape or attribute change.
+    "transformers==4.46.3",
     "accelerate",
     "webdataset",
     "opencv-python",

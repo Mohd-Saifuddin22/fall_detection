@@ -15,7 +15,7 @@
 #   - pyyaml is required by the dataset manifest loader (data/manifests/__init__.py).
 
 ultralytics>=8.3.0          # YOLO family (front-end detection — yolo26m in 8.4+)
-transformers>=4.45.0        # HuggingFace — VideoMAE, ViTPose backbones
+transformers==4.46.3        # HuggingFace — VideoMAE, ViTPose backbones; pinned exactly (Issue 006 Prompt #2)
 accelerate>=1.0.0           # HF launcher; required by transformers training
 webdataset>=0.2.103         # Sharded dataset reader (Drive-cached crop clips)
 opencv-python>=4.10.0       # Video decode / draw utilities
