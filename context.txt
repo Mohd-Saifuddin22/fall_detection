@@ -12,7 +12,7 @@ and switched from the Kaggle mirror to the authoritative
 University of Rzeszów URFD source. The full pipeline is wired
 end-to-end in `colab/000_full_pipeline.ipynb`.
 
-- **Current HEAD:** `8188142`
+- **Current HEAD:** `b9578a2`
 - **Verification:** 667 tests pass.
 - **Next issue:** Issue 006 VideoMAE.
 
@@ -75,7 +75,9 @@ authoritative source and gives the full 70 cam0 clips
 - `7f2629d` — labelling
 - `3825df7` — notebook wiring
 - `bbfa612` — `shutil` fix
-- `8188142` — `frame_index_offset` fix
+- `8188142` — `frame_index_offset` fix (labeling smoke → offset=1)
+- `cf4b5f4` — context.txt state refresh (post switch-over)
+- `b9578a2` — reconcile Issue 006 doc (capability-first killer risk)
 
 ---
 
@@ -3525,10 +3527,11 @@ from data.urfd_labels import (
 
 label, is_confuser = label_window(
     clip_id="urfd-debug-fall-01-cam0-rgb",
-    frame_indices=[1, 2, ..., 16],
+    frame_indices=[0, 1, ..., 15],   # REAL crop indices are 0-based
     csv_labels=parsed,
-    # frame_index_offset=0 by default — see "Frame-index alignment"
-    # below.
+    frame_index_offset=1,            # REQUIRED for real crops: 0-based
+                                     # crop frame_index → 1-based CSV.
+                                     # See "Frame-index alignment" below.
     # labeling_rule=DefaultWindowLabelingRule() — Issue 006 can
     # pass a different subclass to swap the rule.
 )
@@ -3559,25 +3562,33 @@ ADL clips:
 
 ### Frame-index alignment decision
 
-The brief flagged a potential offset between the crop metadata
-and the URFD CSV's `frame_number`:
+**RESOLVED (commit 8188142, re-verified b9578a2): crop
+frame_index is 0-based; URFD CSV is 1-based; real callers pass
+`frame_index_offset=1`.** Verified against the actual code:
 
-- URFD CSV `frame_number` is 1-based.
-- University RGB filenames are 1-based
-  (`fall-01-cam0-rgb-001.png`).
-- The Issue 002 perception layer and Issue 003 cropping
-  layer carry the 1-based absolute frame index forward —
-  `frame_index` in `cropping.track_windows.TrackedBox` and
-  `window.frame_indices` on `TrackWindow` are 1-based. The
-  crop metadata sidecar persists `"frame_index": frame_idx`
-  (1-based).
+- `perception/tracker.py:403` uses `enumerate(stream)` with no
+  `start=`, so detection `frame_index` is **0-based**.
+- `cropping/runner.py:130,181` reads `raw["frame_index"]` and
+  writes it to `meta.json` unchanged — **no `+1` anywhere** in
+  the perception → crop chain. So the crop sidecar's
+  `"frame_index"` is 0-based.
+- URFD CSV `frame_number` is 1-based (RGB filenames also 1-based,
+  `fall-01-cam0-rgb-001.png`).
 
-So the caller's default is `frame_index_offset=0` (no shift).
-`label_window` exposes `frame_index_offset` as an explicit
-parameter so a future change to the crop metadata's
-frame-indexing convention can be applied at the call site — a
-single number that documents the alignment, not a silent
-assumption.
+Therefore real crop windows must be joined to CSV labels with
+`frame_index_offset=1`. The live notebook smoke
+(`000_full_pipeline.ipynb`) already does this.
+
+NOTE (open cleanup, specced to minimax): `label_window`'s
+default is still `frame_index_offset=0` and its docstring in
+`data/urfd_labels.py` still (wrongly) claims crops are 1-based.
+The default 0 is a mechanical "no shift" knob that the *unit
+tests* rely on (they feed synthetic 1-based lists), so the
+default must NOT be flipped — instead the false docstrings are
+being corrected and a correct-by-construction real-data entry
+point (offset baked in) is being added so 006 cannot forget the
+`+1`. Until that lands, EVERY real-crop call site must pass
+`frame_index_offset=1` explicitly.
 
 ### Guard behavior
 
