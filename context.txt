@@ -3927,3 +3927,240 @@ fall_detection/
 ├── context.txt                      # this file
 └── (Drive-only: datasets/urfd/, artifacts/perception/, etc.)
 ```
+
+---
+
+## Issue 006 Prompt #1 — Pipeline A VideoMAE scaffold
+
+This prompt stands up the **first** part of Issue 006: data wiring, GPU / environment recording, tiny-slice overfit, and evaluation-harness plumbing. **Not** in scope: full fine-tune, real validation, scheduler, weights pushed anywhere. A separate prompt will run the actual fine-tune and report formal results.
+
+### Scope and non-goals (carried over from Issue 006)
+
+- Build a new notebook `colab/006_pipeline_a_videomae.ipynb`, **separate** from `colab/000_full_pipeline.ipynb`. The new notebook reads already-computed crop shards from Drive; it never re-runs raw-frame staging, perception, or cropping.
+- Reuse `colab/setup.py`, `colab/data_mode.py`, and the existing `pipeline_a/load_crops.py` instead of duplicating configuration.
+- Hugging Face video-classification tutorial is an **API reference only** — its accuracy-only metric, `.avi` data pipeline, custom normalisation, and Hub-push flow are NOT copied.
+- Do NOT build the full fine-tuning system, do NOT run a long training job, do NOT commit generated weights or large artefacts.
+
+### Decisions
+
+1. **Model**: `MCG-NJU/videomae-base` with a binary classification head (`num_labels=2`, `label2id={"no_fall": 0, "fall": 1}`, `id2label={0: "no_fall", 1: "fall"}`, `ignore_mismatched_sizes=True`).
+2. **Inputs**: The pipeline_a crop loader already emits ImageNet-normalised `(T, 3, H, W) float32` tensors. The notebook does **not** re-normalise — the VideoMAE model's `patch_embeddings` consumes them directly.
+3. **Frame reconciliation**: 32-frame crop → model's configured `num_frames` via uniform temporal subsampling. The target T is read from `model.config.num_frames`, NOT hard-coded, so a future VideoMAE variant that expects 32 frames works without notebook edits.
+4. **Real-crop labelling**: every window is labelled via `label_window_from_crop_meta(...)` — the supported real-crop entry point added in the prior prompt. The primitive `label_window(...)` is never called on real crop data in the new notebook.
+5. **Split policy**: by source clip, never by window. Deterministic shuffled split (seed=42) at 70/15/15; held-back is informational, not used at this prompt.
+6. **Frozen-tier guard**: `ExecutionContext.EVALUATION` denies frozen access by design. The notebook asserts no `frozen_unseen_test` clips appear in any split. Real final-judgement reads land in Issue 007.
+7. **Tiny-slice overfit**: 3 fall + 3 no-fall windows from the train split, 5 AdamW steps at lr=5e-5, collapse threshold 0.30. A non-collapsing loss is a **wiring problem**, not a capacity problem — surfaced loudly rather than silently swallowed.
+8. **Eval plumbing**: aggregate AUPRC + recall printed (the priority metrics for rare fall detection per the PRD). Per-slice reports printed if any non-aggregate slices exist. These numbers are **not** formal results.
+
+### Notebook structure (20 cells)
+
+- Cell 0 — markdown: title, scope, hard rules, "why only Prompt #1".
+- §1 (cells 1–2) — Mount Drive + resolve layout. Reuses `colab.data_mode.resolve_data_layout`. Writes to `artifacts/checkpoints/pipeline_a/`, `artifacts/metrics/pipeline_a/`.
+- §1a (cells 3–4) — GPU / environment recording. Captures GPU name, VRAM (GiB), torch version, CUDA version, bf16/fp16 capability. Persists to `metrics/pipeline_a/006_pipeline_a_run_log.json`.
+- §2 (cells 5–6) — Crop-availability guard. Loud failure with "run `colab/000_full_pipeline.ipynb` first" if the expected shape (~70 shards, ~240 windows, 41 fall, 199 no-fall) is missing.
+- §3 (cells 7–8) — VideoMAE model load. Prints `num_frames`, `image_size`, `tubelet_size`, `patch_size`, `hidden_size`. Asserts `pipeline_a.IMAGE_SIZE == model.config.image_size` to catch pinning drift.
+- §4 (cells 9–10) — torch `Dataset` wrapping `pipeline_a.load_crops.load_clip_tensor_from_shards`. `uniform_temporal_subsample` reconciles T. Each clip's label is computed via `label_window_from_crop_meta` and cached on the instance.
+- §5 (cells 11–12) — Real-crop labelling: parse both URFD label CSVs once and build the `clip_id → CSVLabels` map.
+- §6 (cells 13–14) — Split by source clip. Frozen-tier guard via `ExecutionContext.EVALUATION`.
+- §7 (cells 15–16) — Tiny-slice overfit. 3+3 windows, 5 steps, 0.30 collapse threshold.
+- §8 (cells 17–18) — Eval plumbing via `evaluation.metrics.classification.compute_classification_metrics`. Prints AUPRC + recall for the aggregate and any per-slice reports.
+- §9 (cell 19) — Done summary; deferred list.
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `colab/006_pipeline_a_videomae.ipynb` | **New.** 20-cell notebook. Data wiring + GPU recording + tiny-slice overfit + eval plumbing. Reads crop shards from Drive; does NOT re-run staging/perception/cropping. |
+| `context.txt` | This section. |
+
+**No source code changed.** `pipeline_a/load_crops.py`, `data/urfd_labels.py`, `evaluation/*`, `cropping/shard_writer.py`, `colab/setup.py`, `colab/data_mode.py` are all consumed unchanged.
+
+### Stage-runner import audit (new notebook)
+
+The notebook must NOT depend on perception/cropping stage runners or raw-frame staging. Audit results:
+
+- `pipeline_a` (loader) — allowed.
+- `cropping.shard_writer` (read-only utilities: `read_shard`, `safe_member_name`) — allowed.
+- `data.manifests`, `data.urfd_labels` (label CSV parser + `label_window_from_crop_meta`) — allowed.
+- `evaluation.contracts`, `evaluation.execution_context`, `evaluation.metrics.classification`, `evaluation.not_available` — allowed.
+- `transformers` (`VideoMAEForVideoClassification`), `torch`, `numpy` — allowed.
+- **NOT imported**: `perception.local_staging`, `perception.tracker`, `perception.frames`, `cropping.runner`, `data.stage_urfd`, `data.stage_urfd_university`, `data.build_urfd_manifest`, `data.le2i`.
+
+### Outputs on Drive
+
+- `metrics/pipeline_a/006_pipeline_a_run_log.json` — env record (GPU, VRAM, CUDA, torch, bf16/fp16, data mode).
+- `checkpoints/pipeline_a/` — created empty; **no model weights or checkpoints committed** at this prompt.
+
+### Assumptions
+
+1. The crop cache shape on Drive is ~70 shards / ~240 windows / 41 fall / 199 no-fall (verified at Issue 005 close-out).
+2. Both URFD label CSVs (`urfall-cam0-falls.csv`, `urfall-cam0-adls.csv`) persist on Drive under `artifacts/urfd_labels/`.
+3. The Colab runtime is a GPU runtime (T4 / L4 / A100); CPU-only runtimes fail loud at the env-recording step.
+4. The user's `FALL_DETECTION_PROJECT_ROOT` env var points at the repo root so the local-import audit can resolve symbols.
+5. The Hugging Face video-classification tutorial is treated as API reference only; none of its tutorial-specific code paths are reused.
+
+### Open issues / not in this prompt
+
+- Full fine-tune run + scheduler + LR warmup + early stopping. **Next prompt.**
+- Real validation + frozen-unseen test. **Issue 007.**
+- Checkpoint / resume. **Issue 006 spec calls this out** — separate prompt.
+- Class-imbalance handling (weighted loss / oversampling). 41 fall vs 199 no-fall needs an explicit strategy before any reported result.
+- `Trainer` / `TrainingArguments` integration. The notebook keeps the wiring minimal (`AdamW` + manual loop); a follow-up can swap in HF Trainer without changing the data layer.
+- Confusion-matrix-aware splits. Subject-level disjointness is not yet enforced on URFD (no subject id in the manifest); Issue 007 must add it.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 678 tests in 82.055s — OK    # 677 prior + 1 new from the prior prompt; no test removed
+
+$ python scripts/verify_notebook.py colab/006_pipeline_a_videomae.ipynb
+Local imports   : OK (0 error(s))
+Pyflakes        : passed (all clean)
+Status          : OK — notebook is ready for Colab
+
+$ stage-runner import audit
+Stage-runner imports found: NONE    # perception.*, cropping.runner, data.stage_urfd*, etc. all absent
+```
+
+The existing `colab/000_full_pipeline.ipynb` was NOT modified at this prompt, so no re-verification of it was required; its last verification (after the prior `label_window_from_crop_meta` change) still holds.
+
+---
+
+## Issue 006 Prompt #1 — crop-availability guard fix
+
+Pre-acceptance review of `colab/006_pipeline_a_videomae.ipynb` caught a blocking bug in the §2 crop-availability guard: it derived the **41 fall / 199 no-fall** window-count check from `meta["label"]`, but `cropping/runner.py` writes that field from `clip_record.label` — i.e. it is **source-clip provenance**, not a window-level fall/no_fall decision. The exact 41/199 numbers in context.txt come from that clip-level breakdown (30 fall clips × ~1-2 windows ≈ 41; 40 ADL clips × ~5 windows ≈ 199), not from a CSV-derived window-level pass.
+
+The fix uses the **stronger correct check** the brief offered: compute the window-level label for every window via `label_window_from_crop_meta(...)` (the supported real-crop entry point) and verify a small set of **consistency invariants** rather than an exact-count match. The exact window-level fall count depends on which windows span the falling/lying region vs. the pre-fall region of each fall clip — a number we do not know a priori — so an exact-count check would either be over-specified or would require a separate audit step.
+
+### Decisions
+
+1. **`meta["label"]` is source-clip provenance only.** The guard records the per-source-label window count for diagnostic transparency but does NOT compare it against a fixed expected window-level-fall number.
+2. **Window-level labels come exclusively from `label_window_from_crop_meta(...)`** against the persisted URFD CSVs. Sub-second for 240 windows × ~32 frames each.
+3. **Invariants checked (cheap, sufficient, and correct):**
+   - every window resolves to one of `fall` / `no_fall` / `unlabeled`
+   - `fall_count + no_fall_count + unlabeled_count == total_windows`
+   - **no ADL-source (no_fall source) window resolves to `fall`** — that would be a CSV / offset wiring bug
+   - shard count, total window count, unique-clip count, and clip-id shape (all in expected bands; ~70 / ~240 / ~70 / `urfd-debug-<seq>-cam0-rgb`)
+4. **Tiny-slice overfit criterion loosened** from the brittle absolute `final_loss > 0.30` to a two-part check:
+   - every loss is **finite** (no NaN / Inf), AND
+   - `final_loss ≤ 0.5 × initial_loss` (substantial relative decrease)
+   This catches both "model didn't learn at all" and "loss exploded" without depending on random init weights.
+5. **Frozen-tier guard made real** by replacing the prefix-string check with `data.manifests.load_manifest` + `select_clips_for_context(manifest, ExecutionContext.EVALUATION)` + `enforce_no_frozen_in_iterable(manifest.clips, ctx)`. The notebook now loads the URFD manifest from `layout.dataset_root/datasets/urfd/manifest.yaml`, computes the EVALUATION-allowed clip set, and asserts every window's `clip_id` lives inside it. Today this is trivially satisfied (URFD is all `DEBUG`); the guard catches a future regression where someone accidentally points the notebook at a vault dataset (omnifall / caucafall / mcfd / fallvision).
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `colab/006_pipeline_a_videomae.ipynb` | Cell 006-7 (§2 guard code): replaced meta-label count check with `label_window_from_crop_meta` + invariants. Cell 006-15 (§6 split code): replaced `clip_id.startswith("frozen")` with real manifest-driven guard via `select_clips_for_context` + `enforce_no_frozen_in_iterable`. Cell 006-16 (§7 markdown): rewrote pass-criteria prose. Cell 006-17 (§7 code): replaced absolute `0.30` threshold with finite + relative-decrease criterion. |
+| `context.txt` | This section. |
+
+**No source code changed.** `data/manifests/__init__.py`, `evaluation/execution_context.py`, `data/urfd_labels.py`, `pipeline_a/load_crops.py` are all consumed unchanged.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 678 tests in 16.988s — OK    # no test removed
+
+$ python scripts/verify_notebook.py colab/006_pipeline_a_videomae.ipynb
+Local imports   : OK (0 error(s))
+Pyflakes        : passed (all clean)
+Status          : OK — notebook is ready for Colab
+
+$ stage-runner import audit
+Stage-runner imports found: NONE    # perception.*, cropping.runner, data.stage_urfd*, etc. all absent
+
+$ python scripts/verify_notebook.py colab/000_full_pipeline.ipynb
+Status          : OK    # unchanged notebook still passes
+```
+
+### Why the original guard could not fail solely on clip-vs-window labelling
+
+Pre-fix, the guard was comparing **clip-level** window counts derived from `meta["label"]` against an **expected-clip-level** shape (41/199 in context.txt came from the same metadata field). The numbers were consistent with each other but were not validating the window-level labelling contract — i.e. the guard could pass even if `label_window_from_crop_meta` was wired wrong (e.g. wrong CSV, swapped fall/ADL directory, missing `+1` offset). Post-fix, the invariants are derived from `label_window_from_crop_meta` directly: a wiring bug in that helper now fails loud (e.g. ADL windows resolving to `fall`, total counts not summing to total windows).
+
+### Pre-acceptance review checklist (closes the brief)
+
+- [x] Crop guard can no longer fail solely because clip-level metadata labels differ from true window-level labels.
+- [x] Window-level labels derived from `label_window_from_crop_meta` and checked against consistency invariants.
+- [x] Tiny-slice overfit threshold replaced with finite + relative-decrease criterion.
+- [x] Frozen-tier guard uses the real execution-context machinery against the loaded URFD manifest.
+- [x] `python -m unittest discover tests` passes with no test removals.
+- [x] `python scripts/verify_notebook.py colab/006_pipeline_a_videomae.ipynb` reports OK.
+- [x] Stage-runner import audit: NONE.
+
+---
+
+## Issue 006 Prompt #1 — runtime-fix patch
+
+Three runtime crashes were caught by a **cross-cell static check** that the per-cell `verify_notebook.py` missed (the per-cell verifier deliberately classifies cross-cell `undefined name` as warnings; concatenating cells in run order surfaces them as errors).
+
+### Issues fixed
+
+1. **`torch.isfinite` on Python floats** (cell 006-17). `initial_loss` and `final_loss` are Python `float`s (`step_losses[i]`), but the post-loop check called `torch.isfinite(...)` on them — `torch.isfinite` requires a tensor and raises `TypeError` on a float. Switched to `math.isfinite(...)` for the post-loop float check. The per-step tensor loss check inside the training loop still uses `torch.isfinite(loss)` (correct — `loss` is a torch tensor there). `import math` added at the top of the cell.
+
+2. **Manifest-based frozen-tier guard depended on wiped local disk** (cell 006-15). The previous guard loaded `layout.dataset_root / "datasets" / "urfd" / "manifest.yaml"` — but `dataset_root` is the Colab **local** disk (`/content/fall_local`), which is wiped on runtime reset. A standalone Issue 006 session that hasn't re-staged URFD cannot find the manifest and the guard hard-fails before any training runs. Replaced with a **manifest-free debug-tier assertion** over the clip IDs already discovered from the crop shards: any `clip_id` not containing `"-debug-"` fails loud. Today's URFD debug-tier clips (`urfd-debug-<seq>-cam0-rgb`) all match; a future re-pointing at a vault dataset (`omnifall` / `caucafall` / `mcfd` / `fallvision`) would surface immediately without depending on the manifest file.
+
+3. **NameError from renaming `windows` to `records`** (cell 006-7). The §2 guard was refactored to build `records` (a list of dicts with `frame_indices`); later cells (`§5` labelling, `§6` split) iterated `windows`, which was never defined after the refactor. Fixed at the end of `§2` by adding the compatibility alias:
+
+   ```python
+   windows = [(r["clip_key"], r["clip_id"], r["source_label"]) for r in records]
+   ```
+
+   `windows` is now defined exactly once (at the end of `§2`); `records` carries the full per-window info for the `§7` dataset wrapper.
+
+### Cross-cell static check
+
+Sister to `scripts/verify_notebook.py`, but operates on the **concatenated** code-cell source rather than one cell at a time. Run via `python /tmp/cross_cell_check.py` (kept out of the repo):
+
+1. AST parse the concatenated source — surfaces any Python syntax error in the combined source.
+2. Run `pyflakes` on the concatenated source — surfaces undefined names that the per-cell verifier misses.
+3. Audit: confirm only `torch.isfinite(loss)` remains (the per-step tensor loss); no call on `initial_loss`, `final_loss`, or any other Python float.
+
+The check classifies pyflakes "redefinition" / "imported but unused" warnings as benign (those are artifacts of concatenating cells with shared imports) and treats "undefined name" as a hard error.
+
+### Files changed
+
+| Path | Change |
+|---|---|
+| `colab/006_pipeline_a_videomae.ipynb` | Cell 006-7: added `import math` was NOT needed here; added `windows = [...]` compatibility alias at the very end. Cell 006-15: removed manifest guard + `data.manifests.load_manifest` / `select_clips_for_context` / `enforce_no_frozen_in_iterable` imports; replaced with manifest-free debug-tier clip-id assertion. Cell 006-17: added `import math`; switched `torch.isfinite(...)` on floats to `math.isfinite(...)`; kept `torch.isfinite(loss)` on the per-step tensor. |
+| `context.txt` | This section. |
+
+**No source code changed.** The notebook now consumes `data.urfd_labels`, `data.manifests`, `evaluation.execution_context`, `pipeline_a/load_crops`, `cropping/shard_writer`, `colab/data_mode` unchanged.
+
+### Verification
+
+```
+$ python -m unittest discover tests
+Ran 678 tests in 21.762s — OK    # no test removed
+
+$ python scripts/verify_notebook.py colab/006_pipeline_a_videomae.ipynb
+Local imports   : OK (0 error(s))
+Pyflakes        : passed (all clean)
+Status          : OK — notebook is ready for Colab
+
+$ python scripts/verify_notebook.py colab/000_full_pipeline.ipynb
+Status          : OK — notebook is ready for Colab    # unchanged notebook still passes
+
+$ python /tmp/cross_cell_check.py
+AST parse on concatenated source: PASSED.
+Cross-cell pyflakes issues             : 0
+pyflakes on concatenated source: PASSED.
+torch.isfinite-on-float audit: PASSED (only torch.isfinite(loss) remains — and loss is the per-step tensor).
+
+$ stage-runner import audit
+Stage-runner imports found: NONE    # perception.*, cropping.runner, data.stage_urfd*, etc. all absent
+```
+
+### Runtime-fix checklist (closes the brief)
+
+- [x] `math.isfinite(...)` used for the Python-float finiteness check on `initial_loss` / `final_loss`.
+- [x] `torch.isfinite(...)` retained only for the per-step tensor `loss` inside the training loop.
+- [x] Manifest-based frozen-tier guard replaced with manifest-free debug-tier clip-id assertion.
+- [x] `windows = [...]` compatibility alias defined at the end of `§2`; `records` left for `§7`'s dataset wrapper.
+- [x] `python -m unittest discover tests` passes with no test removals.
+- [x] `python scripts/verify_notebook.py colab/006_pipeline_a_videomae.ipynb` reports OK.
+- [x] Cross-cell static check on concatenated source: AST parse PASSED, 0 cross-cell pyflakes issues.
+- [x] No remaining `torch.isfinite(...)` call on `initial_loss`, `final_loss`, or any other Python float.
+
+---
