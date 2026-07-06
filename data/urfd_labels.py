@@ -62,31 +62,54 @@ Public API:
 Frame-index alignment decision
 -----------------------------
 
-The brief flagged a potential frame-index offset between the
-crop metadata and the URFD CSV ``frame_number``:
+The crop metadata sidecar (``window.frame_indices[i]`` carried
+into ``"frame_index"``) is **0-based** — it is the zero-based
+absolute index produced by :func:`enumerate` in
+:func:`perception.tracker.run_tracker_on_folder` and propagated
+through :class:`cropping.track_windows.TrackedBox` →
+:class:`cropping.track_windows.TrackWindow` →
+:mod:`cropping.runner`. The URFD CSV ``frame_number`` is
+**1-based** (and university RGB filenames are 1-based too:
+``fall-01-cam0-rgb-001.png``). The two are aligned only after
+applying a ``+1`` shift.
 
-- URFD CSV ``frame_number`` is 1-based.
-- University RGB filenames are 1-based
-  (``fall-01-cam0-rgb-001.png``).
-- The Issue 002 perception layer and Issue 003 cropping layer
-  carry the 1-based absolute frame index forward — ``frame_index``
-  in :class:`cropping.track_windows.TrackedBox` and the
-  ``window.frame_indices`` on :class:`TrackWindow` are
-  1-based. The crop metadata sidecar persists
-  ``"frame_index": frame_idx`` (1-based).
+So a real crop caller MUST apply ``+1`` to every crop frame
+index before CSV lookup. The supported entry points for that
+alignment are:
 
-So the caller's default is ``frame_index_offset=0`` (no shift).
-The :func:`label_window` signature exposes ``frame_index_offset``
-as an explicit parameter so a future change to the crop
-metadata's frame-indexing convention can be applied at the
-call site rather than at the parser — a single number that
-documents the alignment, not a silent assumption.
+- :data:`CROP_TO_CSV_FRAME_OFFSET` — the constant ``1``. Pass
+  it explicitly to :func:`label_window` as
+  ``frame_index_offset``.
+- :func:`label_window_from_crop_meta` — wrapper that applies
+  :data:`CROP_TO_CSV_FRAME_OFFSET` for you. **Use this from
+  every real crop path** (Issue 006, the full pipeline
+  notebook's smoke cell, the cropping runner's downstream
+  training step). The raw :func:`label_window` is the
+  primitive — kept for synthetic fixtures, future CSV
+  formats, and explicit-shift adapters — and is reserved for
+  callers that genuinely do not want the crop convention
+  applied.
+
+The default for :func:`label_window` is ``frame_index_offset=0``
+(no shift) because the function is the project-wide primitive
+that any caller — synthetic fixtures, future CSV formats,
+adapters — can plug into without inheriting the crop
+convention. Real crop callers must opt in via the helper or
+the constant; the default is NOT a no-op for real crop data.
+
+The :func:`label_window` signature still exposes
+``frame_index_offset`` as an explicit parameter — a future
+change to the crop metadata's frame-indexing convention can
+be applied at the call site rather than at the parser. The
+helper is the supported default for crop callers; it is NOT
+a replacement for the primitive.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 #: The only legal label values. ``-1`` = upright,
 #: ``0`` = falling / transition, ``1`` = lying on the ground.
@@ -99,6 +122,20 @@ LABEL_MEANINGS: dict[int, str] = {
     0: "falling / transition",
     1: "lying on the ground",
 }
+
+#: Offset a real crop caller must apply to a 0-based crop metadata
+#: frame index to align it with the 1-based URFD CSV ``frame_number``.
+#:
+#: Crop metadata ``frame_index`` is 0-based (perception ``enumerate``);
+#: URFD CSV ``frame_number`` is 1-based. The two are aligned by adding
+#: this constant. Exposed as a single named value so the alignment is
+#: documented at the call site (the literal ``1`` is the alignment
+#: contract, not a magic number) and so :func:`label_window_from_crop_meta`
+#: is the single supported entry point for real crop callers.
+#:
+#: See the module-level "Frame-index alignment decision" section for
+#: the full rationale.
+CROP_TO_CSV_FRAME_OFFSET: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -567,13 +604,26 @@ def label_window(
             :func:`parse_urfd_csv_label_text` /
             :func:`parse_urfd_csv_label_file`.
         frame_index_offset: integer added to each ``frame_index``
-            before CSV lookup. Default ``0`` (no shift) — the
-            Issue 002 perception + Issue 003 cropping layers
-            use 1-based frame indices that align with the CSV
-            directly. A future change to 0-based crop indices
-            can be applied at the call site by passing
-            ``frame_index_offset=1``; the parameter documents
-            the alignment rather than assuming it.
+            before CSV lookup. Default ``0`` (no shift).
+
+            The default ``0`` is the project-wide primitive
+            default — synthetic fixtures, future CSV formats,
+            and explicit-shift adapters all use it without
+            inheriting any crop-specific convention.
+
+            **Real crop callers** carry 0-based frame indices
+            (perception ``enumerate`` → :class:`TrackedBox`
+            → :class:`TrackWindow` → crop metadata
+            ``frame_index``) and must apply ``+1`` before CSV
+            lookup. The supported entry points are
+            :data:`CROP_TO_CSV_FRAME_OFFSET` (pass as this
+            argument) or, easier, :func:`label_window_from_crop_meta`
+            (the wrapper that applies the offset for you).
+
+            The parameter is still exposed so a future change
+            to the crop metadata's frame-indexing convention
+            can be applied at the call site rather than at the
+            parser.
         labeling_rule: pluggable rule. Defaults to
             :data:`DEFAULT_WINDOW_LABELING_RULE` (the Issue 005
             default). Issue 006 may construct a different
@@ -653,8 +703,84 @@ def label_window(
     return labeling_rule.apply(clip_type, tuple(per_frame_labels))
 
 
+def label_window_from_crop_meta(
+    clip_id: str,
+    crop_frame_indices: Sequence[int],
+    csv_labels: CSVLabels,
+    *,
+    labeling_rule: WindowLabelingRule = DEFAULT_WINDOW_LABELING_RULE,
+) -> tuple[str, bool]:
+    """Label a window whose ``frame_index`` came from real crop metadata.
+
+    This is the supported entry point for every real crop caller
+    (Issue 006's training step, the full pipeline notebook's
+    smoke cell, any future training / eval code that reads crop
+    shards). It wraps :func:`label_window` and applies the
+    project-wide crop-metadata → CSV alignment in one place:
+
+        - Crop metadata ``frame_index`` is 0-based (perception
+          :func:`enumerate` → :class:`TrackedBox` →
+          :class:`TrackWindow` → crop metadata sidecar).
+        - URFD CSV ``frame_number`` is 1-based.
+        - The two are aligned by adding
+          :data:`CROP_TO_CSV_FRAME_OFFSET` (``+1``).
+
+    Why a wrapper instead of changing
+    :func:`label_window`'s default to ``+1``: the primitive's
+    default of ``0`` is the project-wide convention that
+    synthetic fixtures, future CSV formats, and explicit-shift
+    adapters all rely on without inheriting any crop-specific
+    convention. Real crop callers opt in to the crop convention
+    by going through this wrapper — Issue 006 cannot
+    accidentally skip the ``+1`` shift at a call site because
+    the only supported crop-caller entry point already has it.
+
+    Args:
+        clip_id: Manifest clip id (``urfd-debug-fall-01-cam0-rgb``
+            or ``urfd-debug-adl-01-cam0-rgb``).
+        crop_frame_indices: The window's frame indices as they
+            appear in real crop metadata — i.e. **0-based**
+            absolute frame numbers from the perception
+            ``enumerate``. A 32-frame window starting at the
+            first frame of a clip is ``range(0, 32)`` here
+            (not ``range(1, 33)``).
+        csv_labels: The parsed :class:`CSVLabels` from
+            :func:`parse_urfd_csv_label_text` /
+            :func:`parse_urfd_csv_label_file`.
+        labeling_rule: Pluggable rule; same shape as
+            :func:`label_window`'s argument.
+
+    Returns:
+        ``(window_label, is_confuser)`` with the same semantics
+        as :func:`label_window`.
+
+    Raises:
+        WindowLabelingError: passed through from
+            :func:`label_window`. The wrapper does not swallow
+            any error — empty ``crop_frame_indices``, non-int
+            entries, non-positive adjusted indices, and unknown
+            ``clip_id`` shapes all surface the same way they
+            would via the primitive.
+
+    See also:
+        - :data:`CROP_TO_CSV_FRAME_OFFSET` — the ``+1`` constant
+          applied internally.
+        - :func:`label_window` — the primitive; use it only when
+          you have a genuine reason not to go through this
+          wrapper.
+    """
+    return label_window(
+        clip_id,
+        crop_frame_indices,
+        csv_labels,
+        frame_index_offset=CROP_TO_CSV_FRAME_OFFSET,
+        labeling_rule=labeling_rule,
+    )
+
+
 __all__: tuple[str, ...] = (
     "CSVLabels",
+    "CROP_TO_CSV_FRAME_OFFSET",
     "DefaultWindowLabelingRule",
     "DEFAULT_WINDOW_LABELING_RULE",
     "FrameLabel",
@@ -668,6 +794,7 @@ __all__: tuple[str, ...] = (
     "WindowLabelingRule",
     "clip_id_to_sequence",
     "label_window",
+    "label_window_from_crop_meta",
     "parse_urfd_csv_label_file",
     "parse_urfd_csv_label_text",
     "sequence_to_clip_type",
