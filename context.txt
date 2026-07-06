@@ -12,9 +12,11 @@ and switched from the Kaggle mirror to the authoritative
 University of Rzeszów URFD source. The full pipeline is wired
 end-to-end in `colab/000_full_pipeline.ipynb`.
 
-- **Current HEAD:** `09b4a56`
-- **Verification:** 667 tests pass.
-- **Next issue:** Issue 006 VideoMAE.
+- **Current HEAD:** `ed21d9f`
+- **Verification:** 678 tests pass.
+- **Next issue:** Issue 006 VideoMAE — **Prompt #1 (scaffold) committed** (`colab/006_pipeline_a_videomae.ipynb`), **pending a Colab visual-test run** (GPU-gated; not yet executed on Colab). Prompt #2 = real fine-tune + imbalance handling + checkpoint/resume + formal metrics.
+
+> As-built note (supersedes the intermediate detail in the 006 changelog below): the 006 notebook's frozen-tier guard is **manifest-free** — it asserts every crop `clip_id` contains `-debug-`. The intermediate manifest-based guard (`load_manifest` + `select_clips_for_context`) was **reverted** because the URFD manifest lives on the wiped-on-restart local disk, which would break a standalone 006 session. Any changelog `[x]` claiming the manifest-based guard is historical, not current.
 
 ### Status at a glance
 
