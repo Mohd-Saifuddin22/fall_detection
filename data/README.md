@@ -215,27 +215,41 @@ you — see `perception/frames.py:FrameFolderReader`. Do not bypass it.
 
 ### How URFD gets there
 
-1. Add two secrets in Colab Secrets: `KAGGLE_USERNAME` and `KAGGLE_KEY`.
-   **Never** hardcode them, write them to disk, or commit them.
-2. Run `colab/002_perception_urfd.ipynb` step 4 — it calls
-   `data.stage_urfd.stage_urfd_from_kaggle(drive_root)`.
-3. The script downloads **only** from the whitelisted slug
-   `tanmaydacha/urfd-dataset`. Any other slug raises before any network call.
-4. On success, a `.staged_from_kaggle.txt` marker file is written so
-   re-runs short-circuit and never re-download.
+URFD now comes from the **University of Rzeszów** page, not the old
+Kaggle mirror — so **no Kaggle credentials are needed for URFD**.
 
-Future sessions must reuse the staged Drive copy — no re-downloads.
+1. Run `colab/000_full_pipeline.ipynb` §4 — it calls
+   `data.stage_urfd_university.stage_urfd_from_university(layout.root, csv_root=layout.artifact_root)`.
+2. The stager downloads **only** from the whitelisted base URL
+   `https://fenix.ur.edu.pl/~mkepski/ds/data/` (every other host / scheme
+   fails loud *before* any network call): 70 cam0 RGB zips
+   (fall-01..30 + adl-01..40, ~4 GB) plus both label CSVs
+   (`urfall-cam0-falls.csv`, `urfall-cam0-adls.csv`).
+3. Frames stage to local disk (LOCAL mode, wiped on restart); the CSVs
+   persist on Drive (`layout.artifact_root`). On success a
+   `.staged_from_university.txt` marker is written so re-runs
+   short-circuit and never re-download.
 
-### URFD credential rule
+Future sessions must reuse the staged copy — no re-downloads.
 
-- Credentials live in **Colab Secrets** (`KAGGLE_USERNAME`, `KAGGLE_KEY`).
-- The staging script reads them, sets two environment variables, and
-  returns. It never `print()`s the values, never writes them to a file,
-  never returns them from any function, never logs them.
-- The provenance marker file records only the **slug** and the source
-  ("colab_secrets"), not the credential values.
-- If you run outside Colab, the staging script looks for
-  `~/.kaggle/kaggle.json` on disk instead. We do NOT auto-create it.
+> **Legacy (superseded):** the old Kaggle path
+> (`data/stage_urfd.py::stage_urfd_from_kaggle`, slug
+> `tanmaydacha/urfd-dataset`, `KAGGLE_USERNAME` / `KAGGLE_KEY` secrets) is
+> kept in-tree for reference but is **no longer the URFD driver**. Kaggle
+> credentials are still used elsewhere (Le2i via `kagglehub`); the
+> credential-safety rule below applies there.
+
+### Credential safety rule (any Kaggle-backed dataset, e.g. Le2i)
+
+- Credentials live in **Colab Secrets** (`KAGGLE_USERNAME`, `KAGGLE_KEY`);
+  **never** hardcode them, write them to disk, or commit them.
+- Staging code reads them, sets two environment variables, and returns.
+  It never `print()`s the values, never writes them to a file, never
+  returns them from any function, never logs them.
+- Provenance markers record only the **source** (e.g. slug +
+  "colab_secrets"), never the credential values.
+- Outside Colab, staging looks for `~/.kaggle/kaggle.json` on disk
+  instead. We do NOT auto-create it.
 
 ### Honest-metric note (URFD has no ground truth)
 
