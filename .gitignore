@@ -65,3 +65,9 @@ artifacts/checkpoints/
 # Local secrets (defensive — none expected)
 .env
 *.local
+
+# Internal AI-supervisor planning docs — kept LOCAL, not published to the
+# public repo. context.txt is the living state doc; issues/ holds the PRD +
+# per-issue specs. Untracked via `git rm --cached`; the files stay on disk.
+/context.txt
+/issues/
